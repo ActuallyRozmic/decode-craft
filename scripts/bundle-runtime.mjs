@@ -4,6 +4,25 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 /**
+ * Entry and lazy-group chunks that must reference a CLI module before it joins
+ * the shared chunk. Measured on representative commands: lower values grow the
+ * shared chunk every single command loads; higher values restore many small
+ * chunks that slow the full command catalog.
+ */
+const CLI_SHARED_CHUNK_MIN_SHARE_COUNT = 12;
+
+/**
+ * CLI command groups load lazily. Modules shared by many groups share one
+ * chunk, so a single command avoids hundreds of tiny imports while the full
+ * catalog still loads each group's own code once.
+ */
+const CLI_CODE_SPLITTING = {
+  groups: [
+    { name: "cli-shared", minShareCount: CLI_SHARED_CHUNK_MIN_SHARE_COUNT },
+  ],
+};
+
+/**
  * Reduce filesystem resolution during CLI and MCP startup. Keep dependencies
  * external, dynamic imports lazy, and original compiled worker entrypoints.
  */
@@ -123,7 +142,7 @@ export const bundleRuntime = async (root) => {
         paths: (id) =>
           isMetadataModule(id) ? "../generatedPackageMetadata.js" : id,
         minifyInternalExports: directory === "mcp",
-        codeSplitting: true,
+        codeSplitting: directory === "mcp" ? true : CLI_CODE_SPLITTING,
         strictExecutionOrder: true,
         minify: false,
         sourcemap: false,

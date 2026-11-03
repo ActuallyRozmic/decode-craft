@@ -3,7 +3,7 @@ import { publishCliAnalysisEvidence } from "./analysisEvidenceDelivery.js";
 import { JAVASCRIPT_APPLICATION_PROVIDER } from "../domain/investigationProviders.js";
 import { createProgressReporter } from "../application/ProgressReporter.js";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
-import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
+import { cliJavaScriptResourceScope } from "./cliJavaScriptResources.js";
 import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import type { JsonValue } from "../domain/jsonValue.js";
@@ -49,42 +49,6 @@ export const cliJavaScriptSourcePaths = async (
   return { ok: true, value: [...(sourcePath ?? []), ...parsed.data] };
 };
 
-/**
- * One scope for every JavaScript analysis in this process. A healthy worker
- * stays parked between commands; {@link closeCliJavaScriptResources} stops it.
- * Pending cleanup is still retried before each command returns.
- */
-let retainedScope: ArtifactResourceScope | undefined;
-/** One shutdown shared by the exit callback and the dispatch `finally`. */
-let closing: Promise<void> | undefined;
-
-const cliAnalysisScope = (): ArtifactResourceScope => {
-  retainedScope ??= new ArtifactResourceScope();
-  return retainedScope;
-};
-
-/**
- * Stop the process-owned JavaScript worker. Callers that overlap share the
- * attempt in flight. The scope stays owned when shutdown fails, so the next
- * call retries instead of treating the worker as already released.
- */
-export const closeCliJavaScriptResources = (): Promise<void> => {
-  if (closing !== undefined) return closing;
-  const scope = retainedScope;
-  if (scope === undefined) return Promise.resolve();
-  let published: Promise<void>;
-  published = scope
-    .close()
-    .then(() => {
-      if (retainedScope === scope) retainedScope = undefined;
-    })
-    .finally(() => {
-      if (closing === published) closing = undefined;
-    });
-  closing = published;
-  return published;
-};
-
 /** Execute the shared CLI boundary for static JavaScript analysis. */
 export const runCliJavaScriptApplicationAnalysis = async (
   input: unknown,
@@ -104,7 +68,7 @@ export const runCliJavaScriptApplicationAnalysis = async (
     },
     { minimumIntervalMs: 0 },
   );
-  const resources = cliAnalysisScope();
+  const resources = cliJavaScriptResourceScope();
   const result = await analyzeJavaScriptApplication(input, resources, {
     environment,
     progress,

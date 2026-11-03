@@ -30,7 +30,7 @@ it("reports invalid nested semantic graph Evidence as caller input through CLI a
     "export function parse(value) { return JSON.parse(value); }\n",
   );
 
-  const cli = createCli({});
+  const cli = await createCli({});
   const analyzed = await serveCli(cli, [
     "analyze-javascript-application",
     root,
@@ -143,7 +143,7 @@ it("excludes local exports from writes-only traces through CLI and MCP", async (
     ].join("\n"),
   );
 
-  const cli = createCli({});
+  const cli = await createCli({});
   const analyzed = await serveCli(cli, [
     "analyze-javascript-application",
     root,
@@ -207,7 +207,7 @@ it("traces exact empty property names through CLI and MCP", async () => {
     join(root, "main.js"),
     "const routes = {'': 'HOME', x: 'NAMED'}; const root = routes['']; const named = routes.x;\n",
   );
-  const cli = createCli({});
+  const cli = await createCli({});
   const analyzed = await serveCli(cli, [
     "analyze-javascript-application",
     root,
@@ -274,7 +274,7 @@ it("traces exact empty property names through CLI and MCP", async () => {
 });
 
 const assertSuccessfulTraceParity = async (
-  cli: ReturnType<typeof createCli>,
+  cli: Awaited<ReturnType<typeof createCli>>,
   harness: Awaited<ReturnType<typeof createApplicationMcpHarness>>,
   application: ReturnType<typeof parseEvidence>,
   query: {
@@ -373,7 +373,7 @@ const assertTraceContextsResolve = (
 };
 
 const serveCli = async (
-  cli: ReturnType<typeof createCli>,
+  cli: Awaited<ReturnType<typeof createCli>>,
   arguments_: readonly string[],
 ): Promise<{ readonly stdout: string; readonly exitCode: number }> => {
   let stdout = "";

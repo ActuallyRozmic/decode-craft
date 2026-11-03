@@ -41,16 +41,15 @@ it.each([
       deviceManager: bindings,
     });
     let stdout = "";
-    await createCli({}, undefined, provider).serve(
-      ["list-frida-processes", option, value, "--json"],
-      {
-        env: {},
-        exit: () => {},
-        stdout: (text) => {
-          stdout += text;
-        },
+    await (
+      await createCli({}, undefined, provider)
+    ).serve(["list-frida-processes", option, value, "--json"], {
+      env: {},
+      exit: () => {},
+      stdout: (text) => {
+        stdout += text;
       },
-    );
+    });
     expect(JSON.parse(stdout)).toMatchObject({
       code,
       details: { diagnostics: { [field]: value } },
@@ -80,18 +79,17 @@ it.each([
   };
   let stdout = "";
   let exitCode = 0;
-  await createCli({}, undefined, provider).serve(
-    ["list-frida-devices", "--json"],
-    {
-      env: {},
-      exit: (code) => {
-        exitCode = code;
-      },
-      stdout: (text) => {
-        stdout += text;
-      },
+  await (
+    await createCli({}, undefined, provider)
+  ).serve(["list-frida-devices", "--json"], {
+    env: {},
+    exit: (code) => {
+      exitCode = code;
     },
-  );
+    stdout: (text) => {
+      stdout += text;
+    },
+  });
   expect(exitCode).toBe(0);
   expect(closed).toBe(true);
   const output = FRIDA_TOOL_CONTRACTS.find(
@@ -131,7 +129,9 @@ it.each([false, true])(
       if (cleanupFails) throw new Error("final cleanup failed");
     };
     let stdout = "";
-    await createCli({}, undefined, provider).serve(
+    await (
+      await createCli({}, undefined, provider)
+    ).serve(
       ["list-frida-processes", "--device-id", "chosen-device", "--json"],
       {
         env: {},
@@ -228,7 +228,7 @@ it("maps one-shot Frida CLI target, script, duration, and remote options", async
     },
     async closeAll() {},
   };
-  const cli = createCli({}, undefined, provider);
+  const cli = await createCli({}, undefined, provider);
   let stdout = "";
   let exitCode = 0;
   await cli.serve(
@@ -375,7 +375,9 @@ it("keeps Frida script-file identity in original bytes when UTF-8 decoding repla
       const provider = new FridaInstrumentationManager({ deviceManager });
       let stdout = "";
       let exitCode = 0;
-      await createCli({}, undefined, provider).serve(
+      await (
+        await createCli({}, undefined, provider)
+      ).serve(
         [
           "instrument-with-frida",
           "attach",
@@ -463,7 +465,9 @@ it("awaits failed startup cleanup without clearing an unbound cleanup marker", a
       if (cleanupFails) throw new Error("resume still failed");
     };
     let stdout = "";
-    await createCli({}, undefined, provider).serve(
+    await (
+      await createCli({}, undefined, provider)
+    ).serve(
       [
         "instrument-with-frida",
         "spawn",
@@ -503,16 +507,15 @@ it("preserves observed devices when CLI provider cleanup fails", async () => {
     throw new Error("remote removal failed");
   };
   let stdout = "";
-  await createCli({}, undefined, provider).serve(
-    ["list-frida-devices", "--json"],
-    {
-      env: {},
-      exit: () => {},
-      stdout: (text) => {
-        stdout += text;
-      },
+  await (
+    await createCli({}, undefined, provider)
+  ).serve(["list-frida-devices", "--json"], {
+    env: {},
+    exit: () => {},
+    stdout: (text) => {
+      stdout += text;
     },
-  );
+  });
   const output: unknown = JSON.parse(stdout);
   expect(output).toMatchObject({
     code: "cleanup_incomplete",
@@ -562,7 +565,7 @@ it.each([
         throw new Error("Frida must not start for invalid input");
       },
     } as unknown as FridaInstrumentationPort;
-    const cli = createCli({}, undefined, provider);
+    const cli = await createCli({}, undefined, provider);
     let stdout = "";
     await cli.serve(["instrument-with-frida", ...argv, "--json"], {
       env: {},
@@ -598,7 +601,9 @@ it("advances each Frida script source to the attach target error without attachi
         },
       } as unknown as FridaInstrumentationPort;
       let stdout = "";
-      await createCli({}, undefined, provider).serve(
+      await (
+        await createCli({}, undefined, provider)
+      ).serve(
         [
           "instrument-with-frida",
           "attach",
