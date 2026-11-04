@@ -1,3 +1,5 @@
+import { bindSessionEvidenceExecution } from "./SessionEvidenceReuse.js";
+import { admitCompletedAnalysis } from "../investigation/admitCompletedAnalysis.js";
 import { randomUUID } from "node:crypto";
 import {
   writeEvidenceBundle,
@@ -47,8 +49,10 @@ import {
 } from "./SessionProviderPolicy.js";
 import { InvestigationRecords } from "../investigation/InvestigationRecords.js";
 import { recordEvidenceSources } from "../investigation/recordEvidenceSources.js";
+import { recoverProviderSourceFailure } from "../investigation/sourcePublicationRecovery.js";
 import { BinarySessionRecords } from "./BinarySessionRecords.js";
 import { binarySessionStatus } from "./BinarySessionStatus.js";
+import { SessionRuntimeAvailability } from "./SessionRuntimeAvailability.js";
 import { isSourceEvidenceRetainable } from "./AnalysisSnapshotCache.js";
 import type { BinarySessionDetail } from "../../contracts/sessionStatusContract.js";
 import {
@@ -179,6 +183,7 @@ export class BinarySession
 {
   #active: SessionBinding | undefined;
   #externalMutationCleanupFailure: AnalysisError | undefined;
+  #lastCloseCleanupFailure: AnalysisError | undefined;
   #pendingCleanup:
     | {
         readonly run: SessionRun;
@@ -197,10 +202,7 @@ export class BinarySession
   readonly #bundleResourceFactory: BundleResourceClientFactory | undefined;
   #activeBundleResources: ActiveBundleResourceSession | undefined;
   #pendingBundleResourceCleanup: ActiveBundleResourceSession[] = [];
-  readonly #runtimeUnavailability = new Map<
-    string,
-    { readonly reason: string }
-  >();
+  readonly #runtimeAvailability = new SessionRuntimeAvailability();
   readonly #availabilityListeners = new Set<() => void | Promise<void>>();
 
   constructor(
@@ -459,8 +461,8 @@ export class BinarySession
       current: this.#active,
       target,
       options,
-      stagedSnapshotMatches: (target, profile) =>
-        this.matchesSnapshot(target, profile),
+      stagedSnapshotMismatch: (target, profile) =>
+        this.snapshotMismatch(target, profile),
     }).then((resolved) =>
       resolved.ok && isAborted(options.signal)
         ? err(
@@ -488,8 +490,8 @@ export class BinarySession
           current: this.#active,
           path,
           options: admitted,
-          stagedSnapshotMatches: (target, profile) =>
-            this.matchesSnapshot(target, profile),
+          stagedSnapshotMismatch: (target, profile) =>
+            this.snapshotMismatch(target, profile),
         }),
       options,
     );
@@ -507,8 +509,8 @@ export class BinarySession
             ...resolved,
             current: this.#active,
             options,
-            stagedSnapshotMatches: (target, profile) =>
-              this.matchesSnapshot(target, profile),
+            stagedSnapshotMismatch: (target, profile) =>
+              this.snapshotMismatch(target, profile),
           }),
         ),
       options,
@@ -1012,14 +1014,29 @@ export class BinarySession
     closed: Result<null, AnalysisError>,
     retry: AnalysisCleanupRetry | undefined,
   ): Result<null, AnalysisError> {
+    this.#lastCloseCleanupFailure = undefined;
     if (
       !closed.ok &&
       retry !== undefined &&
       closed.error.cleanupIncomplete &&
       this.#retainsCloseCleanup()
-    )
+    ) {
       closed.error.bindCleanupRetry(retry);
+      this.#lastCloseCleanupFailure = closed.error;
+    }
     return closed;
+  }
+
+  /** Only a retired target's known close owner can offer this status retry. */
+  #statusCleanupRetry(): AnalysisCleanupRetry | undefined {
+    if (
+      this.#active !== undefined ||
+      this.#activeBundleResources !== undefined ||
+      this.#externalMutationCleanupFailure?.cleanupIncomplete === true ||
+      !this.#retainsCloseCleanup()
+    )
+      return undefined;
+    return this.#lastCloseCleanupFailure?.cleanupRetry;
   }
 
   /** Owners the next close retries; external mutation owners retry elsewhere. */
@@ -1240,6 +1257,7 @@ export class BinarySession
       this.#pendingBundleResourceCleanup[0] ??
       this.#pendingCleanup?.run;
     const client = run?.client;
+    const cleanupRetry = this.#statusCleanupRetry();
     return binarySessionStatus({
       ...options,
       investigation: this.investigationStatistics(),
@@ -1252,11 +1270,12 @@ export class BinarySession
           }),
       route: this.#currentRoute(),
       router: this.#providerRouter,
-      runtimeUnavailability: this.#runtimeUnavailability,
+      runtimeUnavailability: this.#runtimeAvailability.entries,
       runId: run?.runId,
       runtimeLineageSnapshots: client?.runtimeLineageSnapshots?.() ?? [],
       requestActivitySnapshots: client?.requestActivitySnapshots?.() ?? [],
       providerOperationHealth: client?.operationHealthSnapshot?.() ?? null,
+      ...(cleanupRetry === undefined ? {} : { cleanupRetry }),
       cleanupPending:
         this.#externalMutationCleanupFailure?.cleanupIncomplete === true ||
         this.#retainsCloseCleanup(),
@@ -1301,8 +1320,33 @@ export class BinarySession
     arguments_: Readonly<Record<string, JsonValue>>,
     options?: ExecutionOptions,
   ): Promise<Result<AnalysisExecution, AnalysisError>> {
+    return this.#trackedExecute(name, arguments_, options);
+  }
+
+  /** Preserve the one-shot caller's Evidence identity if source retention fails. */
+  executeForDirectObservation(
+    name: Parameters<AnalysisOperationPort["execute"]>[0],
+    arguments_: Readonly<Record<string, JsonValue>>,
+    evidenceParameters: Readonly<Record<string, JsonValue>>,
+    options?: ExecutionOptions,
+  ): Promise<Result<AnalysisExecution, AnalysisError>> {
+    return this.#trackedExecute(name, arguments_, options, evidenceParameters);
+  }
+
+  #trackedExecute(
+    name: Parameters<AnalysisOperationPort["execute"]>[0],
+    arguments_: Readonly<Record<string, JsonValue>>,
+    options?: ExecutionOptions,
+    recoveryParameters?: Readonly<Record<string, JsonValue>>,
+  ): Promise<Result<AnalysisExecution, AnalysisError>> {
     const generation = this.#transitionGeneration;
-    const call = this.#execute(name, arguments_, options, this.#transition);
+    const call = this.#execute(
+      name,
+      arguments_,
+      options,
+      this.#transition,
+      recoveryParameters,
+    );
     this.#calls.set(call, generation);
     return call.finally(() => this.#calls.delete(call));
   }
@@ -1374,6 +1418,7 @@ export class BinarySession
     arguments_: Readonly<Record<string, JsonValue>>,
     options: ExecutionOptions | undefined,
     transition: Promise<void>,
+    recoveryParameters?: Readonly<Record<string, JsonValue>>,
   ): Promise<Result<AnalysisExecution, AnalysisError>> {
     const transitioned = await this.#waitForTransition(
       name,
@@ -1414,6 +1459,7 @@ export class BinarySession
     // A failed reply cannot prove that a dispatched metadata write rolled back.
     // Stop replay before dispatch, including reads overlapping the write.
     if (capability.effects.mutatesArtifact) this.invalidateSnapshot();
+    const dispatch = this.#runtimeAvailability.dispatch();
     const call = active.client.execute(name, arguments_, options);
     const result = unrecordedExecution(await call);
     const profiled = bindExecutionTarget(
@@ -1442,7 +1488,15 @@ export class BinarySession
       this.#active === active
     )
       this.#active.nativeSourceAdmitted = true;
-    this.#observeRuntimeAvailability(name, execution);
+    if (
+      this.#runtimeAvailability.observe(
+        dispatch,
+        capability,
+        active.route.capabilities.values(),
+        execution,
+      )
+    )
+      this.#emitAvailabilityChanged();
     // Source facts belong to the observation, even when this query cannot be
     // replayed (for example a Ghidra procedure read without a document selector).
     if (execution.ok && execution.value.sourceEvidence !== undefined) {
@@ -1450,29 +1504,61 @@ export class BinarySession
         (source) => this.recordEvidence(source),
         execution.value.sourceEvidence,
       );
-      if (!sourcesRecorded.ok) return sourcesRecorded;
+      if (!sourcesRecorded.ok) {
+        recoverProviderSourceFailure({
+          error: sourcesRecorded.error,
+          operation: name,
+          parameters: recoveryParameters ?? arguments_,
+          execution: {
+            ...execution.value,
+            sourceEvidence: execution.value.sourceEvidence,
+            subject:
+              execution.value.subject === undefined
+                ? active.target
+                : execution.value.subject,
+          },
+          admit: this.admitRecoveryObservation.bind(this),
+          hasEvidence: this.hasEvidence.bind(this),
+        });
+        return sourcesRecorded;
+      }
     }
     if (
       execution.ok &&
       isSourceEvidenceRetainable(name, capability, arguments_) &&
       profile !== undefined
     ) {
+      const evidenceExecution = {
+        ...execution.value,
+        analysisProfile: profile,
+        subject:
+          execution.value.subject === undefined
+            ? active.target
+            : execution.value.subject,
+      };
+      const admitted = admitCompletedAnalysis(
+        name,
+        arguments_,
+        evidenceExecution,
+        this.admitRecoveryObservation.bind(this),
+      );
+      if (!admitted.ok) return admitted;
       const evidence = createAnalysisExecutionEvidence(
         name,
         arguments_,
-        {
-          ...execution.value,
-          analysisProfile: profile,
-          subject:
-            execution.value.subject === undefined
-              ? active.target
-              : execution.value.subject,
-        },
+        evidenceExecution,
         "observed",
       );
       const recorded = this.recordEvidence(evidence);
       if (!recorded.ok) return recorded;
-      const retained = { ...execution.value, evidenceId: evidence.evidence_id };
+      const authenticated = this.evidenceForAnalysis(evidence.evidence_id);
+      const retained =
+        authenticated === undefined
+          ? { ...execution.value, evidenceId: evidence.evidence_id }
+          : bindSessionEvidenceExecution(
+              { ...execution.value, evidenceId: evidence.evidence_id },
+              authenticated,
+            );
       if (cacheable && execution.value.cachePolicy !== "live")
         this.recordSnapshot({
           target: active.target,
@@ -1486,56 +1572,8 @@ export class BinarySession
     return execution;
   }
 
-  #observeRuntimeAvailability(
-    operation: AnalysisOperation,
-    result: Result<AnalysisExecution, AnalysisError>,
-  ): void {
-    if (result.ok) {
-      if (this.#markRuntimeAvailable(operation))
-        this.#emitAvailabilityChanged();
-      return;
-    }
-    if (result.error._tag === "AnalysisCapabilityUnavailableError") {
-      if (this.#markRuntimeUnavailable(operation, result.error.message))
-        this.#emitAvailabilityChanged();
-      return;
-    }
-    if (
-      [
-        "ProviderAdapterError",
-        "HopperProcessError",
-        "HopperStartError",
-      ].includes(result.error._tag)
-    ) {
-      const capabilities = this.#active?.route.capabilities;
-      const providerId = capabilities?.get(operation)?.provider.id;
-      let changed = false;
-      for (const descriptor of capabilities?.values() ?? [])
-        if (providerId !== undefined && descriptor.provider.id === providerId)
-          changed =
-            this.#markRuntimeUnavailable(
-              descriptor.operation,
-              `${result.error._tag}: ${result.error.message}`,
-            ) || changed;
-      if (changed) this.#emitAvailabilityChanged();
-    }
-  }
-
-  #markRuntimeAvailable(operation: string): boolean {
-    return this.#runtimeUnavailability.delete(operation);
-  }
-
-  #markRuntimeUnavailable(operation: string, reason: string): boolean {
-    const current = this.#runtimeUnavailability.get(operation);
-    if (current?.reason === reason) return false;
-    this.#runtimeUnavailability.set(operation, { reason });
-    return true;
-  }
-
   #clearRuntimeAvailability(): void {
-    if (this.#runtimeUnavailability.size === 0) return;
-    this.#runtimeUnavailability.clear();
-    this.#emitAvailabilityChanged();
+    if (this.#runtimeAvailability.clear()) this.#emitAvailabilityChanged();
   }
 
   #emitAvailabilityChanged(): void {

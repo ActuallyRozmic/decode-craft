@@ -32,6 +32,9 @@ import {
   type RelationshipCoverage,
 } from "./relationshipCoverage.js";
 
+/** Predicate shared by ordinary provider analysis observations. */
+export const ANALYSIS_EVIDENCE_PREDICATE = "rea.analysis";
+
 /** Provider identity schema shared by evidence-bearing persistence formats. */
 export const providerSchema = z.strictObject({
   id: z.string().min(1),
@@ -423,7 +426,8 @@ export function* createImmutableEvidenceSteps(
   });
 }
 
-const normalizeEvidenceObservation = (
+/** Build the same borrowed envelope used by Evidence normalization; callers must admit it before cloning. */
+export const evidenceEnvelopeForAdmission = (
   target: EvidenceSubjectTarget | BinaryTarget | undefined,
   provider: EvidenceProvider,
   observation: EvidenceObservationInput,
@@ -438,22 +442,16 @@ const normalizeEvidenceObservation = (
           architecture: target.architecture ?? null,
           local_path: target.path,
         };
-  const semantic = {
-    subject:
-      subject === null
-        ? null
-        : {
-            digest: subject.digest,
-            format: subject.format,
-            architecture: subject.architecture,
-          },
+  return {
+    evidence_id: `ev_${"0".repeat(64)}`,
+    subject,
     provider: {
       id: provider.id,
       name: provider.name,
       version: provider.version,
     },
     analysis_profile: observation.analysisProfile ?? null,
-    predicate_type: observation.predicateType ?? "rea.analysis",
+    predicate_type: observation.predicateType ?? ANALYSIS_EVIDENCE_PREDICATE,
     operation: observation.operation,
     parameters: observation.parameters,
     raw_result: observation.rawResult ?? null,
@@ -476,6 +474,14 @@ const normalizeEvidenceObservation = (
     locations: [...(observation.locations ?? [])],
     evidence_links: [...(observation.evidenceLinks ?? [])],
   };
+};
+
+const normalizeEvidenceObservation = (
+  target: EvidenceSubjectTarget | BinaryTarget | undefined,
+  provider: EvidenceProvider,
+  observation: EvidenceObservationInput,
+) => {
+  const envelope = evidenceEnvelopeForAdmission(target, provider, observation);
   const sharedResult =
     typeof observation.result === "object" &&
     observation.result !== null &&
@@ -483,11 +489,7 @@ const normalizeEvidenceObservation = (
   const selectedSchema = sharedResult
     ? evidenceSchema.safeExtend({ normalized_result: immutableResultSchema })
     : evidenceSchema;
-  const normalized = selectedSchema.parse({
-    ...semantic,
-    evidence_id: `ev_${"0".repeat(64)}`,
-    subject,
-  });
+  const normalized = selectedSchema.parse(envelope);
   // The envelope has already been parsed into an independent snapshot. Only
   // its derived identifier changes here; parsing again clones the full payload
   // and recomputes the same digest while the previous snapshot is still live.

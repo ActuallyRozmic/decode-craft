@@ -54,6 +54,27 @@ export interface AnalysisCleanupObservation {
   readonly resources: readonly string[];
 }
 
+/**
+ * How long the adapter delivering a failure keeps REA's runtime and provider
+ * session for its caller. An MCP connection continues: later calls reuse the
+ * session and can update runtime settings. A one-shot invocation, such as a
+ * CLI command, releases its provider session and exits before its caller can
+ * act; only a new invocation's launch settings or arguments apply.
+ */
+export type AnalysisCallerLifetime = "continuing" | "invocation";
+
+/**
+ * Producer guidance that holds only for a continuing caller, kept apart from
+ * the request's outcome. The error's own message and remediation must remain
+ * true after an invocation has released the provider session.
+ */
+export interface AnalysisContinuingCallerGuidance {
+  /** Appended to the outcome, such as that the provider session remains usable. */
+  readonly userMessage?: string;
+  /** Replaces the remediation, such as a same-session runtime setting update. */
+  readonly remediationAction?: string;
+}
+
 /** Optional provider-neutral context that must survive typed error projection. */
 export interface AnalysisErrorOptions extends ErrorOptions {
   /** Typed primary retained when a later lifecycle failure composes this error. */
@@ -61,6 +82,16 @@ export interface AnalysisErrorOptions extends ErrorOptions {
   /** Producer-owned, caller-safe facts retained through every typed projection. */
   readonly diagnostics?: Readonly<Record<string, JsonValue>> | undefined;
   readonly limit?: AnalysisSettingLimit | undefined;
+  readonly continuingCallerGuidance?:
+    | AnalysisContinuingCallerGuidance
+    | undefined;
+  /**
+   * The same diagnostics recorded for an invocation caller, present only when
+   * an embedded child failure projects differently for that lifetime.
+   */
+  readonly invocationDiagnostics?:
+    | Readonly<Record<string, JsonValue>>
+    | undefined;
   readonly capturedOutput?: AnalysisCapturedOutput | undefined;
   readonly cleanup?: AnalysisCleanupObservation | undefined;
   readonly partialObservation?: AnalysisPartialObservation | undefined;
@@ -69,6 +100,43 @@ export interface AnalysisErrorOptions extends ErrorOptions {
 /** Exact cleanup owner that can attribute its currently unresolved resources. */
 export interface AnalysisCleanupResourceOwner {
   readonly cleanupResources: readonly string[] | undefined;
+}
+
+/** Result completed before its source Evidence could be published. */
+export type SourcePublicationCompletion =
+  | {
+      readonly kind: "unretained-evidence";
+      readonly source_closure: "not-established";
+      readonly evidence: Evidence;
+    }
+  | {
+      readonly kind: "retained-evidence";
+      readonly source_closure: "not-established";
+      readonly evidence_id: string;
+    }
+  | {
+      readonly kind: "unretained-observation";
+      readonly source_closure: "not-established";
+      readonly observation: Readonly<Record<string, JsonValue>>;
+    }
+  | {
+      readonly kind: "inline-evidence";
+      readonly retention: "one-shot-session" | "unknown";
+      readonly source_closure: "not-established";
+      readonly evidence: Evidence;
+    }
+  | {
+      readonly kind: "omitted";
+      readonly source_closure: "not-established";
+      readonly reason:
+        | "primary-authentication-failed"
+        | "insufficient-authentication-headroom"
+        | "recovery-input-invalid";
+    };
+
+export interface SourcePublicationRecovery {
+  readonly source: AnalysisPartialObservation | undefined;
+  readonly completed: SourcePublicationCompletion;
 }
 
 /** Base class for expected analysis, provider, and session failures. */
@@ -87,6 +155,12 @@ export abstract class AnalysisError extends Error {
     | undefined;
   #cleanupDependents: WeakRef<AnalysisError>[] = [];
   readonly diagnostics: Readonly<Record<string, JsonValue>> | undefined;
+  readonly continuingCallerGuidance:
+    | Readonly<AnalysisContinuingCallerGuidance>
+    | undefined;
+  readonly invocationDiagnostics:
+    | Readonly<Record<string, JsonValue>>
+    | undefined;
   readonly capturedOutput: AnalysisCapturedOutput | undefined;
   readonly cleanup: AnalysisCleanupObservation | undefined;
   cleanupIncomplete: boolean;
@@ -103,6 +177,14 @@ export abstract class AnalysisError extends Error {
       options?.diagnostics === undefined
         ? undefined
         : structuredClone(options.diagnostics);
+    this.continuingCallerGuidance =
+      options?.continuingCallerGuidance === undefined
+        ? undefined
+        : Object.freeze({ ...options.continuingCallerGuidance });
+    this.invocationDiagnostics =
+      options?.invocationDiagnostics === undefined
+        ? undefined
+        : structuredClone(options.invocationDiagnostics);
     this.capturedOutput =
       options?.capturedOutput === undefined
         ? undefined
@@ -117,6 +199,17 @@ export abstract class AnalysisError extends Error {
   readonly userCategory: "cancelled" | undefined = undefined;
   readonly executionFailure: string | undefined = undefined;
   partialObservation: AnalysisPartialObservation | undefined;
+  sourcePublicationRecovery: SourcePublicationRecovery | undefined;
+
+  /** Keep the failed source and completed result with their error owner. */
+  retainSourcePublication(completed: SourcePublicationCompletion): this {
+    this.sourcePublicationRecovery = {
+      source: this.partialObservation,
+      completed,
+    };
+    this.partialObservation = undefined;
+    return this;
+  }
 
   get cleanupPrimary(): AnalysisError | undefined {
     return this.#cleanupPrimary;
@@ -186,8 +279,25 @@ export abstract class AnalysisError extends Error {
   retainDiagnostics(diagnostics: Readonly<Record<string, JsonValue>>): this {
     Object.assign(this, {
       diagnostics: structuredClone({ ...this.diagnostics, ...diagnostics }),
+      ...(this.invocationDiagnostics === undefined
+        ? {}
+        : {
+            invocationDiagnostics: structuredClone({
+              ...this.invocationDiagnostics,
+              ...diagnostics,
+            }),
+          }),
     });
     return this;
+  }
+
+  /** Diagnostics recorded for a caller with this lifetime. */
+  diagnosticsFor(
+    callerLifetime: AnalysisCallerLifetime,
+  ): Readonly<Record<string, JsonValue>> | undefined {
+    return callerLifetime === "invocation"
+      ? (this.invocationDiagnostics ?? this.diagnostics)
+      : this.diagnostics;
   }
 
   retainSecondaryFailure(
@@ -258,6 +368,20 @@ export const primaryAnalysisError = (error: AnalysisError): AnalysisError => {
   while (error.cleanupPrimary !== undefined) error = error.cleanupPrimary;
   return error;
 };
+
+/** Find the completed publication outcome owned anywhere in a cleanup chain. */
+export const sourcePublicationRecoveryOf = (
+  error: AnalysisError,
+): SourcePublicationRecovery | undefined => {
+  for (
+    let owner: AnalysisError | undefined = error;
+    owner !== undefined;
+    owner = owner.cleanupPrimary
+  )
+    if (owner.sourcePublicationRecovery !== undefined)
+      return owner.sourcePublicationRecovery;
+  return undefined;
+};
 import type {
   PartialProcessCaptureObservation,
   ProcessCaptureCleanupReport,
@@ -318,6 +442,12 @@ import type { WebArtifactAcquisition } from "./webArtifactAcquisition.js";
 
 /** Provider-neutral evidence collected before a typed analysis failure. */
 export type AnalysisPartialObservation =
+  | {
+      readonly kind: "omitted-observation";
+      readonly reason:
+        | "insufficient-authentication-headroom"
+        | "recovery-input-invalid";
+    }
   | { readonly kind: "unretained-evidence"; readonly evidence: Evidence }
   | { readonly kind: "retained-evidence"; readonly evidence_id: string }
   | SavedAnalysisSnapshotPartialObservation

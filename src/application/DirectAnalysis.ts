@@ -1,3 +1,4 @@
+import { admitCompletedAnalysis } from "./investigation/admitCompletedAnalysis.js";
 import type { EspFlashSelection } from "../domain/firmware/espFlashLocation.js";
 import type { ExecutableFormatHint } from "../domain/dosCom.js";
 import { dispatchQueuedInterrupts } from "../process/queuedInterrupts.js";
@@ -35,15 +36,15 @@ import {
   AnalysisSnapshotMismatchError,
   type PublishedEvidenceFile,
 } from "../domain/evidenceErrors.js";
-import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
+import { analysisErrorWithCancellation } from "../domain/analysisErrorCancellation.js";
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import { access, stat } from "node:fs/promises";
 import { absoluteCallerPath } from "../filesystem/callerPath.js";
 import { requiresNativeSourceAdmissionBeforeReplay } from "./binary/AnalysisSnapshotCache.js";
 import { classifyBinaryTargetFilesystemFailure } from "./BinaryTargetResolver.js";
 import {
+  snapshotBindingMismatch,
   snapshotEvidenceForQuery,
-  snapshotMatchesTarget,
 } from "../domain/analysisSnapshot.js";
 import type { AnalysisProfileCommitment } from "../domain/analysisProfile.js";
 import { profilelessNativeDispatchProfile } from "./binary/ProfilelessNativeWorkflowSnapshot.js";
@@ -60,6 +61,7 @@ import {
   composedLimitationBudget,
   executeComposedWorkflow,
   createWorkflowEvidence,
+  retainPartialWorkflowEvidence,
   workflowSnapshotRecord,
   recordWorkflowUnknowns,
 } from "./WorkflowEvidence.js";
@@ -74,6 +76,7 @@ import type { BinaryTargetError } from "../domain/configurationErrors.js";
 import {
   directAnalysisCleanupFailure,
   projectDirectAnalysisFailure,
+  projectInvocationFailure,
   managedAnalysisCleanupFailure,
   withSessionCleanup,
 } from "./DirectAnalysisCleanup.js";
@@ -119,7 +122,10 @@ const ARTIFACT_ANALYSIS_OPERATION_SET: ReadonlySet<string> = new Set(
 /**
  * Open one binary, execute one tool, and always release provider resources.
  * Unlike MCP mode, every CLI invocation is intentionally isolated and does not
- * retain a target or provider client for a subsequent command.
+ * retain a target, provider session or runtime setting for a subsequent
+ * command. Failures are projected for that invocation lifetime, so they never
+ * offer same-session reuse or runtime updates; a new invocation's launch
+ * environment or arguments carry any changed limit.
  */
 export const runDirectAnalysis = async (
   dependencies: DirectAnalysisDependencies,
@@ -257,7 +263,13 @@ export const runProviderAnalysis = async (
         operationSignal,
       );
       await dispatchQueuedInterrupts();
-      if (!original.ok) return err(cliError(original.error, path));
+      if (!original.ok)
+        return err(
+          cliError(
+            retainFinalCancellation(original.error, tool, operationSignal),
+            path,
+          ),
+        );
       const evidence = withEvidenceCallerInputPath(original.value, path);
       if (operationSignal.aborted)
         return err(
@@ -301,6 +313,7 @@ export const runManagedProviderExecution = async (
   tool: ManagedToolName,
   signal?: AbortSignal,
   parameters: Readonly<Record<string, JsonValue>> = {},
+  recoveryParameters?: Readonly<Record<string, JsonValue>>,
 ): Promise<Result<AnalysisExecution, AnalysisError>> =>
   withProcessCancellation(signal, async (operationSignal) => {
     const session = await dependencies.createManagedBinarySession();
@@ -309,9 +322,14 @@ export const runManagedProviderExecution = async (
       async () => {
         const opened = await session.open(path, { signal: operationSignal });
         if (!opened.ok) return opened;
-        return await session.execute(tool, parameters, {
-          signal: operationSignal,
-        });
+        return recoveryParameters === undefined
+          ? await session.execute(tool, parameters, { signal: operationSignal })
+          : await session.executeForDirectObservation(
+              tool,
+              parameters,
+              recoveryParameters,
+              { signal: operationSignal },
+            );
       },
       managedAnalysisCleanupFailure,
     );
@@ -332,6 +350,7 @@ const runManagedProviderAnalysis = async (
     tool,
     signal,
     arguments_,
+    evidenceParameters,
   );
   if (!execution.ok) return execution;
   const value = execution.value;
@@ -554,13 +573,35 @@ const runAnalysis = async (
     readonly cleanupError?: AnalysisError;
   }>(
     session,
-    async () => ({ result: await execute() }),
+    async () => {
+      const result = await execute();
+      if (
+        !result.ok &&
+        result.error.sourcePublicationRecovery?.completed.kind ===
+          "retained-evidence"
+      ) {
+        const retained = session.evidenceForAnalysis(
+          result.error.sourcePublicationRecovery.completed.evidence_id,
+        );
+        if (retained !== undefined)
+          result.error.sourcePublicationRecovery = {
+            ...result.error.sourcePublicationRecovery,
+            completed: {
+              kind: "inline-evidence",
+              retention: "one-shot-session",
+              source_closure: "not-established",
+              evidence: retained,
+            },
+          };
+      }
+      return { result };
+    },
     (value, cleanupError) => ({ ...value, cleanupError }),
   );
   await dispatchQueuedInterrupts();
   const result = outcome.result.ok
     ? completeProviderEvidence(outcome.result.value, signal)
-    : outcome.result;
+    : err(retainFinalCancellation(outcome.result.error, tool, signal));
   if (!result.ok && publishedSnapshot !== undefined)
     result.error.retainDiagnostics({
       analysis_snapshot: { ...publishedSnapshot },
@@ -577,6 +618,19 @@ const runAnalysis = async (
   }
   return result.ok ? ok(result.value) : err(cliError(result.error, path));
 };
+
+/** Preserve an earlier failure and a cancellation observed during final cleanup. */
+const retainFinalCancellation = (
+  failure: AnalysisError,
+  tool: string,
+  signal: AbortSignal,
+): AnalysisError =>
+  signal.aborted
+    ? analysisErrorWithCancellation(
+        failure,
+        new AnalysisCancelledError(tool, { cause: signal.reason }),
+      )
+    : failure;
 
 const executeAnalysisTool = async (input: {
   readonly session: BinarySession;
@@ -624,6 +678,12 @@ const executeAnalysisTool = async (input: {
         new EnhancedTools(observed).execute(tool, input.arguments, signal),
       composedLimitationBudget(tool),
     );
+    retainPartialWorkflowEvidence(result, {
+      target: input.openedTarget,
+      operation: tool,
+      parameters: input.evidenceParameters,
+      upstreamProfile: evidenceProfile,
+    });
     result = retainAnalysisResultSources(
       tool,
       (source) => session.recordEvidence(source),
@@ -648,7 +708,12 @@ const executeAnalysisTool = async (input: {
         : { cachePolicy: result.value.cachePolicy }),
     });
   }
-  let result = await session.execute(tool, input.arguments, { signal });
+  let result = await session.executeForDirectObservation(
+    tool,
+    input.arguments,
+    input.evidenceParameters,
+    { signal },
+  );
   if (
     tool === "xrefs" &&
     typeof input.arguments.address === "string" &&
@@ -670,23 +735,32 @@ const executeAnalysisTool = async (input: {
     );
     if (!address.ok) return address;
     if (address.value !== input.arguments.address)
-      result = await session.execute(
+      result = await session.executeForDirectObservation(
         tool,
         { ...input.arguments, address: address.value },
+        input.evidenceParameters,
         { signal },
       );
   }
   if (!result.ok) return result;
+  const observation = {
+    ...result.value,
+    subject:
+      result.value.subject === undefined
+        ? input.openedTarget
+        : result.value.subject,
+  };
+  const admitted = admitCompletedAnalysis(
+    tool,
+    input.evidenceParameters,
+    observation,
+    session.admitRecoveryObservation.bind(session),
+  );
+  if (!admitted.ok) return admitted;
   const evidence = createAnalysisExecutionEvidence(
     tool,
     input.evidenceParameters,
-    {
-      ...result.value,
-      subject:
-        result.value.subject === undefined
-          ? input.openedTarget
-          : result.value.subject,
-    },
+    observation,
     "observed",
   );
   return ok({ evidence });
@@ -742,10 +816,16 @@ const prepareSnapshot = async (options: {
     ...targetSelection(options),
   });
   if (!target.ok) return target;
-  if (!snapshotMatchesTarget(loaded.value.target, target.value))
+  const mismatch = snapshotBindingMismatch(
+    loaded.value,
+    target.value,
+    undefined,
+  );
+  if (mismatch?.target !== undefined)
     return err(
       new AnalysisSnapshotMismatchError(
         "Analysis snapshot target does not match the requested binary",
+        mismatch,
       ),
     );
   return ok({ snapshot: loaded.value, target: target.value });
@@ -849,6 +929,6 @@ const cliError = (
 ): JsonValue => ({
   error: "Analysis failed",
   ...(callerInputPath === undefined
-    ? projectAnalysisError(error)
+    ? projectInvocationFailure(error)
     : projectDirectAnalysisFailure(error, callerInputPath)),
 });
