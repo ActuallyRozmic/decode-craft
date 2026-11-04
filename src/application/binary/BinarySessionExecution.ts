@@ -54,6 +54,19 @@ interface PrepareSessionExecutionInput {
   ) => AnalysisExecution | undefined;
 }
 
+/** Recovery for an operation absent from the selected binary route. */
+export const undeclaredOperationGuidance = (
+  operation: string,
+  entryCommentAvailable = false,
+): string => {
+  const entryComment =
+    entryCommentAvailable &&
+    (operation === "set_comment" || operation === "set_inline_comment")
+      ? ` If the address is exactly a function entry and an entry comment is intended, use MCP annotate_native_function with procedure set to that entry and ${operation === "set_comment" ? "comment" : "inline_comment"}, or CLI rea annotate-native-function with the target, entry and ${operation === "set_comment" ? "--comment" : "--inline-comment"}. This edits session metadata, not arbitrary-address comments; CLI session edits end with the invocation.`
+      : "";
+  return `The selected provider does not declare ${operation}.${entryComment} In MCP, inspect binary_session with detail: "complete" for candidate availability, target support, and capabilities. If a suitable candidate is available, explicitly call open_binary with the same target and its provider_id. In CLI, use rea providers to inspect readiness and capabilities; target support remains unknown until a target is selected. Select an available candidate with --provider and check the result. Switching may discard provider session edits; retained Evidence does not restore them. Candidate availability does not guarantee support for this target.`;
+};
+
 /** Resolve capability, profile, and snapshot state before invoking a provider. */
 export const prepareSessionExecution = (
   input: PrepareSessionExecutionInput,
@@ -76,6 +89,18 @@ export const prepareSessionExecution = (
         active.route.binding?.identity.id ?? active.route.identity.id,
         operation,
         capability?.reason ?? "operation is not declared by this provider",
+        capability === undefined
+          ? {
+              userMessage: undeclaredOperationGuidance(
+                operation,
+                active.route.binding !== null &&
+                  active.route.capabilities.get("annotate_native_function")
+                    ?.available === true &&
+                  active.route.capabilities.get("annotate_native_function")
+                    ?.provider.id === active.route.binding.identity.id,
+              ),
+            }
+          : undefined,
       ),
     );
   }
