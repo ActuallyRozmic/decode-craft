@@ -19,6 +19,7 @@ import type { Logger } from "pino";
 import { withEvidenceCallerInputPath } from "../domain/evidence.js";
 import { createImmutableEvidenceBundle } from "../domain/evidenceBundle.js";
 import { retainAnalysisResultSources } from "./investigation/recordEvidenceSources.js";
+import { createInvestigationEvidenceClosureChecker } from "./investigation/InvestigationEvidence.js";
 import type { Evidence } from "../domain/evidence.js";
 import type { NativeToolName } from "../contracts/native/nativeToolContracts.js";
 import type { EnhancedToolName } from "../contracts/enhancedInputs.js";
@@ -458,8 +459,21 @@ const runAnalysis = async (
             : routeProviderIdentity(route, tool),
           evidenceProfile,
         });
-        if (cached !== undefined)
-          return ok(withEvidenceCallerInputPath(cached, path));
+        if (cached !== undefined) {
+          if (cached.evidence_links.length === 0)
+            return ok(withEvidenceCallerInputPath(cached, path));
+          const records = new Map(
+            snapshot.evidence_bundle.records.map((record) => [
+              record.evidence_id,
+              record,
+            ]),
+          );
+          const checkClosure = createInvestigationEvidenceClosureChecker({
+            evidenceForAnalysis: (id) => records.get(id),
+          });
+          if (checkClosure(cached.evidence_links))
+            return ok(withEvidenceCallerInputPath(cached, path));
+        }
       }
     }
     const openOptions = {
