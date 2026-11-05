@@ -81,6 +81,22 @@ export interface AnalysisExecution extends AnalysisObservation {
    * output.
    */
   readonly referencesTruncated?: boolean;
+  /** The producer needs this observation retained as source Evidence for composed workflows. */
+  readonly requiresSourceEvidence?: true;
+  /** Known reference-discovery gaps; absent means coverage was not reported. */
+  readonly referenceCoverageGaps?: readonly {
+    readonly code: string;
+    readonly scope: "image" | "observation";
+    readonly description: string;
+  }[];
+  /** Typed source facts for this live xref observation; absent means unreported. */
+  readonly referenceClassifications?: readonly {
+    readonly sourceAddress: string;
+    readonly targetAddress: string;
+    readonly kind: "stored_pointer";
+    readonly provenance: string;
+    readonly width: number;
+  }[];
 }
 
 interface CreateAnalysisExecutionOptions {
@@ -91,6 +107,9 @@ interface CreateAnalysisExecutionOptions {
   readonly limitations?: readonly string[];
   readonly relationshipCoverage?: RelationshipCoverage;
   readonly referencesTruncated?: boolean;
+  readonly requiresSourceEvidence?: true;
+  readonly referenceClassifications?: AnalysisExecution["referenceClassifications"];
+  readonly referenceCoverageGaps?: AnalysisExecution["referenceCoverageGaps"];
   readonly locations?: readonly EvidenceLocation[];
   readonly sourceEvidence?: readonly Evidence[];
   readonly subject?: EvidenceSubjectTarget | null;
@@ -149,6 +168,15 @@ export function createAnalysisExecution(
     ...(options.referencesTruncated === undefined
       ? {}
       : { referencesTruncated: options.referencesTruncated }),
+    ...(options.requiresSourceEvidence === undefined
+      ? {}
+      : { requiresSourceEvidence: options.requiresSourceEvidence }),
+    ...(options.referenceCoverageGaps === undefined
+      ? {}
+      : { referenceCoverageGaps: options.referenceCoverageGaps }),
+    ...(options.referenceClassifications === undefined
+      ? {}
+      : { referenceClassifications: options.referenceClassifications }),
     locations: [...(options.locations ?? [])],
     ...(options.sourceEvidence === undefined
       ? {}
