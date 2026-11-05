@@ -1,3 +1,4 @@
+import { procedureReferencesSchema } from "../domain/native/procedureReferences.js";
 import {
   nativeAddressListSchema,
   nativeObservationSourceSchemas,
@@ -10,6 +11,7 @@ import {
   nativeFunctionSummaryViewResultSchema,
   nativeInventorySummaryViewResultSchema,
   nativeFeatureTraceSummaryViewResultSchema,
+  nativeProcedureReferencesSummaryViewResultSchema,
   batchDecompileSummaryViewResultSchema,
   nativeLoadImageSummaryViewResultSchema,
   artifactInventorySummaryViewResultSchema,
@@ -32,11 +34,6 @@ import {
   analysisBookmarkSchema,
   nativeInventoryRowsSchemas,
 } from "../domain/native/nativeInventory.js";
-import {
-  referenceEdgeSchema,
-  unresolvedCallSchema,
-} from "../domain/native/nativeReference.js";
-import { procedureIdentitySchema } from "../domain/native/procedureInfo.js";
 import { z } from "zod";
 import {
   evidenceBundleExportReceiptSchema,
@@ -227,14 +224,9 @@ export const officialOutputSchemas = {
         ),
     }),
   ),
-  procedure_references: evidenceResultOf(
-    z.object({
-      procedure: procedureIdentitySchema,
-      direction: z.enum(["incoming", "outgoing"]),
-      reference_kinds_available: z.boolean(),
-      unresolved_calls: z.array(unresolvedCallSchema),
-      references: z.array(referenceEdgeSchema),
-    }),
+  procedure_references: analysisDetailOutputSchemaOf(
+    procedureReferencesSchema,
+    nativeProcedureReferencesSummaryViewResultSchema,
   ),
   procedure_pseudo_code: evidenceResultOf(nullableText),
   resolve_containing_procedure: analysisDetailOutputSchemaOf(

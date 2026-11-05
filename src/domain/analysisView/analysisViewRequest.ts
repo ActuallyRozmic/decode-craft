@@ -1,3 +1,4 @@
+import { nativeProcedureReferencesViewRequestSchema } from "./nativeProcedureReferencesView.js";
 import {
   nativeObservationViewRequestSchema,
   nativeContextViewRequestSchema,
@@ -86,6 +87,7 @@ export const analysisViewRequestSchema = z.discriminatedUnion("kind", [
   javascriptFactsViewRequestSchema,
   nativeViewSchema,
   nativeInventoryViewRequestSchema,
+  nativeProcedureReferencesViewRequestSchema,
   nativeLoadImageViewRequestSchema,
   artifactInventoryViewRequestSchema,
   wasmViewRequestSchema,
