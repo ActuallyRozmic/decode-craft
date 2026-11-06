@@ -2,6 +2,7 @@ import {
   systemDoctorHost,
   type DoctorCheck,
   type DoctorHost,
+  type DoctorProviderInspection,
 } from "./application/Doctor.js";
 import { fileURLToPath } from "node:url";
 import { inspectJadxProvider } from "./android/JadxDoctor.js";
@@ -15,10 +16,142 @@ import { AnalysisCancelledError } from "./domain/analysisErrorCore.js";
 import { ProviderCleanupError } from "./domain/providerCleanupError.js";
 import { AnalysisCleanupLeaseGroup } from "./artifacts/AnalysisCleanupLease.js";
 import type { RetainedResourceScope } from "./application/AnalysisProvider.js";
+import { RegularFileCleanupFailure } from "./filesystem/OwnedRegularFile.js";
+import { readEffectiveClientRegistrationConfiguration } from "./application/ClientConfigurationFiles.js";
+import { clientRegistrationEnvironmentDetails } from "./application/ClientRegistrationEnvironment.js";
+import {
+  mergeEnvironmentOverrides,
+  snapshotEnvironment,
+} from "./process/snapshotEnvironment.js";
+import { supportedClients } from "./application/SupportedClients.js";
+import { homeDirectoryFromEnvironment } from "./config/homeDirectory.js";
 import {
   inspectLinuxHopperPythonRuntime,
   linuxHopperPythonUnavailable,
 } from "./application/LinuxHopperPython.js";
+
+/**
+ * A selected client's own environment, when its registration records one.
+ * Provider checks read the terminal by default; a caller that asked about one
+ * client wants the values that client passes to the server it starts.
+ */
+interface SelectedRegistrationEnvironment {
+  /** The terminal a selected client inherits, overlaid by its registration. */
+  readonly environment: Readonly<Record<string, string | undefined>>;
+  /** Names the client records as expressions this process cannot evaluate. */
+  readonly unresolved: ReadonlySet<string>;
+}
+
+const selectedRegistrationEnvironment = async (
+  clients: readonly string[],
+  processEnvironment: Readonly<NodeJS.ProcessEnv>,
+  resourceScope: RetainedResourceScope,
+  signal: AbortSignal,
+): Promise<SelectedRegistrationEnvironment | undefined> => {
+  const [selected] = clients;
+  // Only an unambiguous selection can stand for the terminal's environment.
+  if (selected === undefined || clients.length !== 1) return undefined;
+  signal.throwIfAborted();
+  const home = homeDirectoryFromEnvironment(
+    processEnvironment,
+    process.platform,
+  );
+  const client = supportedClients(
+    home,
+    process.platform,
+    processEnvironment,
+  ).find(({ name }) => name === selected);
+  if (client === undefined || client.format === "unsupported") return undefined;
+  const registered = await readSelectedRegistration(
+    client,
+    resourceScope,
+    process.platform,
+  );
+  // Absent, unreadable, or unresolvable: the terminal is the only environment
+  // this process can honestly describe.
+  if (registered === undefined) return undefined;
+  return {
+    environment: registered.values,
+    unresolved: registered.unresolvedSettings,
+  };
+};
+
+/**
+ * Fold a selected registration and the terminal it inherits into the canonical
+ * names a provider check reads: the registration's recorded values win, names
+ * it records as unreadable expressions are dropped, and everything else
+ * survives from the terminal.
+ *
+ * Windows treats setting names case-insensitively, so a registration recording
+ * `ghidra_install_dir` must override the terminal's `GHIDRA_INSTALL_DIR`
+ * rather than sit beside it, and a dropped expression must be found under
+ * either spelling. `snapshotEnvironment` performs that fold;
+ * `mergeEnvironmentOverrides` alone keeps the winning layer's spelling.
+ */
+export const selectedProviderSettings = (
+  selected: SelectedRegistrationEnvironment | undefined,
+  terminal: Readonly<NodeJS.ProcessEnv>,
+  platform: NodeJS.Platform = process.platform,
+): Readonly<Record<string, string | undefined>> => {
+  if (selected === undefined) return terminal;
+  const settings: Record<string, string | undefined> = {
+    ...snapshotEnvironment(
+      mergeEnvironmentOverrides(terminal, selected.environment, platform),
+      platform,
+    ),
+  };
+  for (const name of Object.keys(
+    snapshotEnvironment(
+      Object.fromEntries(
+        [...selected.unresolved].map((entry): [string, string] => [entry, ""]),
+      ),
+      platform,
+    ),
+  ))
+    delete settings[name];
+  return settings;
+};
+
+type SelectedRegistration = {
+  readonly values: Readonly<Record<string, string>>;
+  readonly unresolvedSettings: ReadonlySet<string>;
+};
+
+/** Read the selected client's registration, or report it as unreadable. */
+const readSelectedRegistration = async (
+  client: Parameters<typeof readEffectiveClientRegistrationConfiguration>[0],
+  resourceScope: RetainedResourceScope,
+  platform: NodeJS.Platform,
+): Promise<SelectedRegistration | undefined> => {
+  // A failed close is a retained owner, not a read outcome: transfer it to the
+  // caller's scope so `close()` retries it instead of losing it.
+  const configuration = await resourceScope
+    .run(() =>
+      readEffectiveClientRegistrationConfiguration(client, undefined, platform),
+    )
+    .catch((cause: unknown) => {
+      if (cause instanceof RegularFileCleanupFailure) {
+        resourceScope.retain(cause.owner, cause.path);
+        return undefined;
+      }
+      throw cause;
+    });
+  // A registration this process cannot read says nothing about the values the
+  // client passes on; the terminal is not those values.
+  if (configuration === undefined || !configuration.ok) return undefined;
+  const details = clientRegistrationEnvironmentDetails(
+    configuration.value.document,
+    {},
+    "effective",
+    platform,
+  );
+  return details.ok
+    ? {
+        values: details.value.values,
+        unresolvedSettings: details.value.unresolvedSettings,
+      }
+    : undefined;
+};
 
 /** Compose provider diagnostics at the outer CLI adapter boundary. */
 export const createSystemDoctorHost = (
@@ -73,30 +206,50 @@ export const createSystemDoctorHost = (
       // parser-owned error when IDA itself was explicitly selected.
       return analysisProvider === "ida" ? registration : ok(undefined);
     },
-    providerInspections: async (resourceScope, inspectionSignal) => [
-      await inspectSystemGhidraProvider(
+    providerInspections: async (
+      resourceScope: RetainedResourceScope,
+      inspectionSignal: AbortSignal,
+      clients: readonly string[],
+    ) => {
+      const selected = await selectedRegistrationEnvironment(
+        clients,
         environment,
         resourceScope,
         inspectionSignal,
-      ),
-      await inspectIdaRegistration(
-        environment.REA_IDA_MCP_CONFIG,
-        resourceScope,
-        inspectionSignal,
-        environment.REA_IDA_MCP_CONFIG === undefined
-          ? undefined
-          : readRegistration(
-              environment.REA_IDA_MCP_CONFIG,
-              resourceScope,
-              inspectionSignal,
-            ),
-      ),
-      await inspectJadxProvider(environment, resourceScope, inspectionSignal),
-      await inspectKunaProvider(environment, process.platform, {
-        resourceScope,
-        signal: inspectionSignal,
-      }),
-    ],
+      );
+      const inspectionEnvironment = selectedProviderSettings(
+        selected,
+        environment,
+      );
+      return [
+        await inspectSystemGhidraProvider(
+          inspectionEnvironment,
+          resourceScope,
+          inspectionSignal,
+        ),
+        await inspectIdaRegistration(
+          inspectionEnvironment.REA_IDA_MCP_CONFIG,
+          resourceScope,
+          inspectionSignal,
+          inspectionEnvironment.REA_IDA_MCP_CONFIG === undefined
+            ? undefined
+            : readRegistration(
+                inspectionEnvironment.REA_IDA_MCP_CONFIG,
+                resourceScope,
+                inspectionSignal,
+              ),
+        ),
+        await inspectJadxProvider(
+          inspectionEnvironment,
+          resourceScope,
+          inspectionSignal,
+        ),
+        await inspectKunaProvider(inspectionEnvironment, process.platform, {
+          resourceScope,
+          signal: inspectionSignal,
+        }),
+      ] satisfies readonly DoctorProviderInspection[];
+    },
     linuxDemoRuntimeCheck: (resourceScope, inspectionSignal) =>
       inspectLinuxHopperDemoRuntime(
         environment,
