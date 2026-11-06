@@ -105,7 +105,9 @@ describe("MCP doctor help boundary", () => {
     },
     CLI_INTEGRATION_TIMEOUT_MS,
   );
+});
 
+describe("MCP doctor option validation", () => {
   workspaceCliTest(
     "keeps the actionable error for a genuinely unknown option",
     async ({ cli }) => {
