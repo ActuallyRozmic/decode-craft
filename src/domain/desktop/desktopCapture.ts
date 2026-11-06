@@ -48,6 +48,57 @@ export const desktopCheckpointSchema = z.strictObject({
 });
 export type DesktopCheckpoint = z.infer<typeof desktopCheckpointSchema>;
 
+/**
+ * What a running capture reports beside its progress text, for a driver to
+ * wait on: the window opening, a checkpoint once it has been taken, with its
+ * counts, and a requested name it refused.
+ */
+export const desktopCaptureEventSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("window_open") }),
+  z.strictObject({
+    kind: z.literal("checkpoint"),
+    name: z.string().min(1),
+    trigger: desktopCheckpointSchema.shape.trigger,
+    at_ms: milliseconds,
+    entries: z.int().min(0),
+    changes: z.int().min(0),
+    retained_files: z.int().min(0),
+    retained_bytes: z.int().min(0),
+  }),
+  z.strictObject({
+    kind: z.literal("checkpoint_refused"),
+    name: z.string(),
+    reason: z.string().min(1),
+  }),
+]);
+export type DesktopCaptureEvent = z.infer<typeof desktopCaptureEventSchema>;
+
+/** One progress line `capture-desktop-application` writes to stderr. */
+export const desktopCaptureProgressSchema = z.strictObject({
+  rea_progress: z.strictObject({
+    phase: z.literal("desktop_capture"),
+    message: z.string(),
+    event: desktopCaptureEventSchema.optional(),
+  }),
+});
+export type DesktopCaptureProgress = z.infer<
+  typeof desktopCaptureProgressSchema
+>;
+
+/** The acknowledgement of a taken checkpoint, from what it recorded. */
+export const checkpointTaken = (
+  checkpoint: DesktopCheckpoint,
+): Extract<DesktopCaptureEvent, { kind: "checkpoint" }> => ({
+  kind: "checkpoint",
+  name: checkpoint.name,
+  trigger: checkpoint.trigger,
+  at_ms: checkpoint.at_ms,
+  entries: checkpoint.entries,
+  changes: checkpoint.changes.length,
+  retained_files: checkpoint.retained.length,
+  retained_bytes: checkpoint.retained.reduce((sum, file) => sum + file.size, 0),
+});
+
 const desktopEntrySchema = z.strictObject({
   id: z.string().nullable(),
   path: z.string().min(1),
@@ -213,8 +264,9 @@ export const desktopSessionSchema = z.strictObject({
   opened_files: z.array(
     z.strictObject({ path: z.string().min(1), first_seen_ms: milliseconds }),
   ),
-  /** The first bytes the launched process wrote to stderr. */
+  /** The last bytes the launched process wrote to stderr, up to 8 KiB. */
   stderr: z.string(),
+  /** Whether earlier stderr was dropped to keep the last bytes. */
   stderr_truncated: z.boolean(),
   /** Whether the run-token sweep confirmed every launched process is gone. */
   cleanup: z.strictObject({

@@ -1,5 +1,6 @@
 import { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
 import {
+  isPointerCheck,
   parseDesktopTask,
   type DesktopTask,
   type DesktopTaskCheck,
@@ -40,6 +41,9 @@ import { refuse } from "./DesktopExportInstall.js";
 
 const OPERATION = "export_desktop_application";
 const REWRITE = "Fix the task file and export again.";
+/** Where the change shows on either path: a capture inside a build computer cannot be described with the CLI. */
+const DRAFT =
+  "the task draft, from describe-desktop-application-task or a build computer's stop_build_capture, shows what changed";
 
 /** What the export knows of the app: its name, owned paths, captured home, host identity, state files by home path and the checkpoints it reads. */
 type TaskTarget = Pick<
@@ -147,8 +151,7 @@ const targetProblem = (
     if (named !== undefined)
       return `names ${named}, the capture host's name or user, which the export removes from the seed`;
   }
-  if (check.kind !== "value_equals" && check.kind !== "value_absent")
-    return undefined;
+  if (!isPointerCheck(check)) return undefined;
   return [views.seed, views.end].some(
     (at) => at.get(check.file)?.format === "text",
   )
@@ -248,16 +251,28 @@ export const admitDesktopTask = async (
     throw refuse(
       `Check ${JSON.stringify(failing.id)} fails on the captured end state: ${failing.description}.`,
       "task",
-      "Write checks that the captured end state passes; describe-desktop-application-task shows its views.",
+      `Write checks that the captured end state passes; ${DRAFT}.`,
     );
-  const failingOnSeed = evaluateTaskChecks(task.checks, views.seed)
-    .filter((outcome) => !outcome.passed)
-    .map((outcome) => outcome.id);
-  if (failingOnSeed.length === 0)
+  const seed = evaluateTaskChecks(task.checks, views.seed).filter(
+    (outcome) => !outcome.passed,
+  );
+  if (seed.length === 0)
     throw refuse(
       "Every check already passes on the seed, so the task would be done before the agent starts.",
       "task",
       "Add a check that the change the user made is needed for.",
+    );
+  // Only a failure on what the seed's view shows proves the task is not done yet.
+  const failingOnSeed = seed
+    .filter((outcome) => outcome.undecided !== true)
+    .map((outcome) => outcome.id);
+  if (failingOnSeed.length === 0)
+    throw refuse(
+      `No check fails on what the seed's views show: each failure there may come from a view that could not be read or is cut short (${seed
+        .map(({ id, description }) => `${JSON.stringify(id)}: ${description}`)
+        .join("; ")}).`,
+      "task",
+      `Add a check that fails on what the seed's views hold, such as a line or row of a file read whole; ${DRAFT}.`,
     );
   return {
     summary: {
