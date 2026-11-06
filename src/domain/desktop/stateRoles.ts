@@ -3,6 +3,7 @@ import type {
   DesktopStateChange,
 } from "./desktopCapture.js";
 import { isWithinAny } from "./desktopStateDiff.js";
+import { isLockName } from "./runtimeFiles.js";
 
 /** Why a path is, or is not, treated as the application's state. */
 export type DesktopStateReason =
@@ -11,7 +12,8 @@ export type DesktopStateReason =
   | "named_in_window_title"
   | "selected_path"
   | "dconf_application_keys"
-  | "desktop_service";
+  | "desktop_service"
+  | "desktop_trash";
 
 /** How a later step should treat a path. */
 export type DesktopStateRole =
@@ -30,10 +32,12 @@ const SHARED_DESKTOP_PATHS = [
   ".config/pulse",
   ".local/share/recently-used.xbel",
   ".local/share/gvfs-metadata",
-  ".local/share/Trash",
   ".Xauthority",
   ".ICEauthority",
 ];
+
+/** The freedesktop Trash in the home, where files the user deleted wait under their own names. */
+const DESKTOP_TRASH = ".local/share/Trash";
 
 /**
  * Lowercase names that identify the application in dconf keys. The desktop
@@ -109,6 +113,11 @@ export interface DesktopRoleFacts {
   readonly stateDirectories: readonly string[];
   readonly stateTails: readonly string[];
   readonly selectedRoots: readonly string[];
+  /** Every selected path as named and as walked, innermost walked path first. */
+  readonly selections: readonly {
+    readonly path: string;
+    readonly physical: string;
+  }[];
   readonly titles: readonly string[];
   readonly openedFiles: ReadonlySet<string>;
 }
@@ -137,6 +146,9 @@ export const roleFacts = (
         (relative === null || !stateTails.includes(relative))
       );
     }),
+    selections: [...(state.selected_paths ?? [])].sort(
+      (left, right) => right.physical.length - left.physical.length,
+    ),
     titles: session.windows
       .filter((window) => window.application)
       .flatMap((window) => window.titles),
@@ -203,27 +215,62 @@ export const stateReasons = (
   if (dconfApplicationKeys) reasons.push("dconf_application_keys");
   if (relative !== null && isWithinAny(relative, SHARED_DESKTOP_PATHS))
     reasons.push("desktop_service");
+  if (relative !== null && isWithinAny(relative, [DESKTOP_TRASH]))
+    reasons.push("desktop_trash");
   return reasons;
 };
 
 /**
- * The role that follows from a path's reasons, strongest first. A file the
- * application holds open is a document when a title or the caller names it.
+ * A path's home-relative spelling as the caller selected it: the name given
+ * to the innermost selected path holding it, directly or through a link, so
+ * a file in `~/settings/MuseScore` selected as `~/.config/MuseScore` lies
+ * under `.config/MuseScore`, while a score selected itself keeps its own
+ * name; otherwise its own.
+ */
+export const selectedHomePath = (
+  facts: DesktopRoleFacts,
+  path: string,
+): string | null => {
+  const selection = facts.selections.find(({ physical }) =>
+    isWithinAny(path, [physical]),
+  );
+  return (
+    (selection === undefined
+      ? null
+      : homePath(
+          `${selection.path}${path.slice(selection.physical.length)}`,
+          facts.home,
+        )) ?? homePath(path, facts.home)
+  );
+};
+
+/**
+ * The role that follows from a path's reasons, strongest first. A file in the
+ * desktop Trash is shared whatever else names it, since the user deleted it.
+ * A file the application holds open is a document when a title or the caller
+ * names it. A file the caller selects under a hidden folder of the home, such
+ * as `~/.config/app`, or a dotfile there, is the application's own state, as
+ * is a lock the app holds, such as LibreOffice's `.~lock.<name>#` beside a
+ * document; `selectedAs` is its home path as selected, before links are
+ * resolved.
  */
 export const stateRole = (
   reasons: readonly DesktopStateReason[],
+  selectedAs: string | null = null,
 ): DesktopStateRole => {
+  if (reasons.includes("desktop_trash")) return "shared_desktop";
   const shared = reasons.includes("desktop_service");
   if (
     reasons.includes("dconf_application_keys") ||
     (reasons.includes("state_directory") && !shared)
   )
     return "application_state";
-  if (
-    reasons.includes("named_in_window_title") ||
-    reasons.includes("selected_path")
-  )
-    return "document";
+  if (reasons.includes("named_in_window_title")) return "document";
+  if (reasons.includes("selected_path"))
+    return selectedAs !== null &&
+      (selectedAs.startsWith(".") || isLockName(selectedAs))
+      ? "application_state"
+      : "document";
   if (reasons.includes("opened_by_application") && !shared)
     return "application_state";
   if (shared) return "shared_desktop";

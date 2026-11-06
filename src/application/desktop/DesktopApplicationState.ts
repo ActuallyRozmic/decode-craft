@@ -24,6 +24,7 @@ import {
   applicationNames,
   isApplicationDconfGroup,
   roleFacts,
+  selectedHomePath,
   stateReasons,
   stateRole,
 } from "../../domain/desktop/stateRoles.js";
@@ -378,7 +379,7 @@ const describePath = async (
   return {
     path,
     home_path: path.startsWith(`${home}/`) ? path.slice(home.length + 1) : null,
-    role: stateRole(reasons),
+    role: stateRole(reasons, selectedHomePath(facts, path)),
     reasons,
     format:
       versions.findLast((version) => version.format !== null)?.format ?? null,
