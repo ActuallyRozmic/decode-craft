@@ -1,0 +1,399 @@
+import { gzipSync } from "node:zlib";
+import { describe, expect, it } from "vitest";
+import { parseWarcArchive } from "./parseWarcArchive.js";
+import type { WarcArchive } from "./warcArchive.js";
+
+const artifact = {
+  path: "/artifacts/crawl.warc",
+  sha256: "a".repeat(64),
+  bytes: 0,
+};
+
+const record = (
+  type: string,
+  fields: readonly (readonly [string, string])[],
+  payload = "",
+): string => {
+  const headers = [
+    "WARC/1.1",
+    `WARC-Type: ${type}`,
+    ...fields.map(([name, value]) => `${name}: ${value}`),
+    `Content-Length: ${Buffer.byteLength(payload)}`,
+    "",
+    "",
+  ].join("\r\n");
+  return headers + payload;
+};
+
+const parse = (text: string | Buffer, options = {}) =>
+  parseWarcArchive(
+    Buffer.isBuffer(text) ? text : Buffer.from(text),
+    {
+      ...artifact,
+      bytes: Buffer.isBuffer(text) ? text.length : Buffer.byteLength(text),
+    },
+    { maxRecords: 100, maxDecodedBytes: 1024 * 1024, ...options },
+  );
+
+const parsed = (text: string | Buffer, options = {}): WarcArchive => {
+  const result = parse(text, options);
+  if (!result.ok) throw new Error("expected a parsed archive");
+  return result.value;
+};
+
+describe("parseWarcArchive", () => {
+  it("inventories concatenated records in archive order", () => {
+    const archive = parsed(
+      record(
+        "warcinfo",
+        [["WARC-Record-ID", "<urn:uuid:1>"]],
+        "software: rea\r\n",
+      ) +
+        record(
+          "request",
+          [["WARC-Target-URI", "https://example.test/a"]],
+          "GET /a HTTP/1.1\r\n\r\n",
+        ) +
+        record(
+          "response",
+          [["WARC-Target-URI", "https://example.test/a"]],
+          "HTTP/1.1 204 No Content\r\n\r\n",
+        ),
+    );
+    expect(archive.records.map((entry) => entry.record_type)).toEqual([
+      "warcinfo",
+      "request",
+      "response",
+    ]);
+    expect(archive.records.map((entry) => entry.ordinal)).toEqual([0, 1, 2]);
+    expect(archive.summary).toMatchObject({
+      records: 3,
+      known_types: 3,
+      unknown_types: 0,
+      requests: 1,
+      responses: 1,
+    });
+    expect(archive.source_coverage.status).toBe("complete-within-scope");
+    expect(archive.diagnostics).toEqual([]);
+  });
+
+  it("keeps record offsets on the decoded stream and stays deterministic", () => {
+    const text =
+      record(
+        "resource",
+        [["WARC-Target-URI", "https://example.test/x"]],
+        "body",
+      ) +
+      record(
+        "resource",
+        [["WARC-Target-URI", "https://example.test/y"]],
+        "body",
+      );
+    const first = parsed(text);
+    const second = parsed(text);
+    expect(first).toEqual(second);
+    expect(first.records[0]?.offset).toBe(0);
+    expect(first.records[1]?.offset).toBeGreaterThan(0);
+    expect(first.archive_id).toBe(second.archive_id);
+  });
+
+  it("reports the embedded HTTP status line without decoding bodies", () => {
+    const archive = parsed(
+      record(
+        "response",
+        [["WARC-Target-URI", "https://example.test/a"]],
+        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nmissing",
+      ),
+    );
+    expect(archive.records[0]?.http).toEqual({
+      status_code: 404,
+      reason_phrase: "Not Found",
+      header_bytes: "HTTP/1.1 404 Not Found\r\n".length,
+    });
+    expect(archive.source_coverage.http_bodies).toBe("not-decoded");
+  });
+
+  it("lists unknown record types instead of dropping them", () => {
+    const archive = parsed(record("vendor-extension", [], "opaque"));
+    expect(archive.records[0]).toMatchObject({
+      record_type: "vendor-extension",
+      record_type_known: false,
+    });
+    expect(archive.summary.unknown_types).toBe(1);
+  });
+
+  it("decodes concatenated gzip members", () => {
+    const bytes = Buffer.concat([
+      gzipSync(
+        Buffer.from(
+          record(
+            "request",
+            [["WARC-Target-URI", "https://example.test/1"]],
+            "",
+          ),
+        ),
+      ),
+      gzipSync(
+        Buffer.from(
+          record(
+            "response",
+            [["WARC-Target-URI", "https://example.test/1"]],
+            "HTTP/1.1 200 OK\r\n\r\n",
+          ),
+        ),
+      ),
+    ]);
+    const archive = parsed(bytes);
+    expect(archive.compression).toBe("gzip");
+    expect(archive.summary).toMatchObject({ requests: 1, responses: 1 });
+    expect(archive.records[1]?.http?.status_code).toBe(200);
+  });
+
+  it("stops at max_decoded_bytes instead of inflating further", () => {
+    const archive = parsed(gzipSync(Buffer.alloc(64 * 1024, 0x41)), {
+      maxDecodedBytes: 1024,
+    });
+    expect(archive.compression).toBe("unsupported");
+    expect(archive.diagnostics.map((entry) => entry.code)).toEqual([
+      "decoded-size-limit-reached",
+    ]);
+    expect(archive.source_coverage.status).toBe("partial");
+  });
+
+  it("reports non-gzip non-WARC input as not a stream", () => {
+    const archive = parsed("PK\u0003\u0004not an archive");
+    expect(archive.compression).toBe("identity");
+    expect(archive.diagnostics[0]?.code).toBe("not-a-warc-stream");
+    expect(archive.records).toEqual([]);
+  });
+});
+
+describe("malformed and bounded archives", () => {
+  it("isolates a truncated record and keeps the records before it", () => {
+    const complete = record(
+      "request",
+      [["WARC-Target-URI", "https://example.test/a"]],
+      "",
+    );
+    const truncated = record(
+      "response",
+      [["WARC-Target-URI", "https://example.test/a"]],
+      "HTTP/1.1 200 OK\r\n\r\nbody",
+    ).slice(0, -4);
+    const archive = parsed(complete + truncated);
+    expect(archive.records).toHaveLength(2);
+    expect(archive.records[1]?.payload_bytes).toBeLessThan(
+      archive.records[1]?.content_length ?? 0,
+    );
+    expect(archive.diagnostics.map((entry) => entry.code)).toContain(
+      "truncated-record",
+    );
+    expect(archive.source_coverage.status).toBe("partial");
+  });
+
+  it("reports an invalid Content-Length without inventing an extent", () => {
+    const archive = parsed(
+      "WARC/1.1\r\nWARC-Type: resource\r\nContent-Length: not-a-number\r\n\r\npayload",
+    );
+    expect(archive.records).toHaveLength(1);
+    expect(archive.records[0]?.content_length).toBeNull();
+    expect(archive.diagnostics.map((entry) => entry.code)).toContain(
+      "invalid-content-length",
+    );
+  });
+
+  it("keeps the first value of a repeated header and reports the repeat", () => {
+    const archive = parsed(
+      "WARC/1.1\r\nWARC-Type: resource\r\nWARC-Type: response\r\nContent-Length: 0\r\n\r\n",
+    );
+    expect(archive.records[0]?.record_type).toBe("resource");
+    expect(archive.records[0]?.malformed_header_lines).toEqual([
+      "WARC-Type: response",
+    ]);
+    expect(archive.summary.malformed_headers).toBe(1);
+  });
+
+  it("accepts a repeatable field repeated many times without reporting it", () => {
+    const repeats = 20_000;
+    const archive = parsed(
+      "WARC/1.1\r\nWARC-Type: resource\r\n" +
+        Array.from(
+          { length: repeats },
+          (_, i) => `WARC-Protocol: p${i}\r\n`,
+        ).join("") +
+        "Content-Length: 0\r\n\r\n",
+    );
+    // A repeatable field is valid however often it appears; only non-repeatable
+    // ones are defects. The first value stays authoritative.
+    expect(archive.records[0]?.malformed_header_lines).toEqual([]);
+    expect(archive.summary.malformed_headers).toBe(0);
+    expect(archive.records[0]?.record_type).toBe("resource");
+  });
+
+  it("reports header lines that are not fields", () => {
+    const archive = parsed(
+      "WARC/1.1\r\nWARC-Type: resource\r\nnot a header\r\nContent-Length: 0\r\n\r\n",
+    );
+    expect(archive.records[0]?.malformed_header_lines).toEqual([
+      "not a header",
+    ]);
+    expect(archive.diagnostics.map((entry) => entry.code)).toContain(
+      "invalid-header-line",
+    );
+  });
+
+  it("stops at max_records and says so", () => {
+    const text =
+      record("resource", [], "a") +
+      record("resource", [], "b") +
+      record("resource", [], "c");
+    const archive = parsed(text, { maxRecords: 2 });
+    expect(archive.records).toHaveLength(2);
+    expect(archive.diagnostics.map((entry) => entry.code)).toEqual([
+      "record-limit-reached",
+    ]);
+    expect(archive.source_coverage.status).toBe("partial");
+  });
+
+  it("accepts an empty archive as an empty inventory", () => {
+    const archive = parsed("");
+    expect(archive.records).toEqual([]);
+    expect(archive.summary.records).toBe(0);
+  });
+
+  it("preserves revisit records as records, not resolved responses", () => {
+    const archive = parsed(
+      record(
+        "revisit",
+        [
+          [
+            "WARC-Profile",
+            "http://netpreserve.org/warc/1.1/revisit/identical-payload-digest",
+          ],
+        ],
+        "",
+      ),
+    );
+    expect(archive.records[0]?.record_type).toBe("revisit");
+    expect(archive.records[0]?.profile).toContain("revisit");
+    expect(archive.records[0]?.http).toBeNull();
+    expect(archive.source_coverage.related_records).toBe("not-linked");
+  });
+
+  it("does not report a record's own CRLF separator as trailing bytes", () => {
+    // Two records joined by the CRLF pair one record already ends with. Searching
+    // from the separator matched the next record's `WARC/` only after the gap,
+    // and the separator itself was then reported as stray bytes, so an intact
+    // archive came back `partial`.
+    const archive = parsed(
+      record("response", [
+        ["WARC-Record-ID", "<urn:1>"],
+        ["WARC-Target-URI", "http://example.test/WARC/1.1"],
+      ]) +
+        "\r\n" +
+        record("response", [["WARC-Record-ID", "<urn:2>"]]),
+    );
+    expect(archive.diagnostics).toEqual([]);
+    expect(archive.records).toHaveLength(2);
+    expect(archive.source_coverage.status).toBe("complete-within-scope");
+  });
+
+  it("still reports bytes after the separator as trailing", () => {
+    const archive = parsed(
+      record("response", [["WARC-Record-ID", "<urn:1>"]]) + "junk",
+    );
+    expect(archive.diagnostics.map((d) => d.code)).toEqual(["trailing-bytes"]);
+    expect(archive.source_coverage.status).toBe("partial");
+  });
+
+  it("accepts a field WARC defines as repeatable", () => {
+    // WARC permits these to repeat; rejecting every repeat put valid archives
+    // into `partial` with invalid-header-line diagnostics.
+    const archive = parsed(
+      record("response", [
+        ["WARC-Record-ID", "<urn:1>"],
+        ["WARC-Concurrent-To", "<urn:2>"],
+        ["WARC-Concurrent-To", "<urn:3>"],
+        ["WARC-Protocol", "http/1.1"],
+        ["WARC-Protocol", "ipfs"],
+      ]),
+    );
+    expect(
+      archive.diagnostics.filter((d) => d.code === "invalid-header-line"),
+    ).toEqual([]);
+    expect(archive.source_coverage.status).toBe("complete-within-scope");
+  });
+
+  it("reports a repeated single-value field as malformed", () => {
+    const archive = parsed(
+      record("response", [
+        ["WARC-Type", "response"],
+        ["Content-Type", "application/http"],
+      ]),
+    );
+    expect(archive.diagnostics.map((d) => d.code)).toContain(
+      "invalid-header-line",
+    );
+  });
+});
+
+describe("field validation", () => {
+  it("reports a field name that is not a header token", () => {
+    // "Bad Name: value" passed the old colon-only check, so the field was
+    // dropped without any diagnostic reaching the report.
+    const archive = parsed(
+      "WARC/1.1\r\nWARC-Type: response\r\nBad Name: value\r\nContent-Length: 0\r\n\r\n\r\n",
+    );
+    expect(archive.diagnostics.map((d) => d.code)).toContain(
+      "invalid-header-line",
+    );
+    expect(archive.summary.malformed_headers).toBeGreaterThan(0);
+  });
+});
+
+describe("bounded archives", () => {
+  it("names the line ceiling rather than calling a long line truncated", () => {
+    const longUri = `http://example.test/${"a".repeat(9000)}`;
+    const archive = parsed(
+      record("response", [
+        ["WARC-Record-ID", "<urn:1>"],
+        ["WARC-Target-URI", longUri],
+      ]),
+    );
+    const codes = archive.diagnostics.map((d) => d.code);
+    expect(codes).toContain("header-line-limit-reached");
+    expect(codes).not.toContain("truncated-record");
+    expect(
+      archive.diagnostics.find((d) => d.code === "header-line-limit-reached")
+        ?.message,
+    ).toContain("8192");
+  });
+
+  it("enforces max_decoded_bytes on an uncompressed archive", () => {
+    // The allowance was only applied on the gunzip path, so identity input was
+    // scanned in full and could report complete coverage above the ceiling.
+    const text = record("response", [["WARC-Record-ID", "<urn:1>"]]);
+    const archive = parsed(text, { maxDecodedBytes: 10 });
+    expect(archive.records).toEqual([]);
+    expect(archive.diagnostics.map((d) => d.code)).toEqual([
+      "decoded-size-limit-reached",
+    ]);
+    expect(archive.source_coverage.status).toBe("partial");
+  });
+
+  it("stops allocating diagnostics past the diagnostic ceiling", () => {
+    // One record may carry millions of short malformed lines; `max_records`
+    // does not bound that growth, and the reply-size check ran afterwards.
+    const lines = Array.from(
+      { length: 12_000 },
+      (_, index) => `Bad Line ${index}`,
+    ).join("\r\n");
+    const archive = parsed(
+      `WARC/1.1\r\nWARC-Type: response\r\n${lines}\r\nContent-Length: 0\r\n\r\n\r\n`,
+    );
+    expect(archive.diagnostics.length).toBeLessThanOrEqual(10_001);
+    expect(archive.diagnostics.map((d) => d.code)).toContain(
+      "diagnostic-limit-reached",
+    );
+  });
+});
