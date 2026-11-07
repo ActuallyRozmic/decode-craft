@@ -19,6 +19,7 @@ import type {
   JavaScriptSemanticModuleLink,
 } from "../../domain/javascript/javascriptSemanticIr.js";
 import {
+  explicitJavaScriptLoaderMode,
   isJsonModuleTarget,
   moduleResolutionModeForJavaScriptReference,
 } from "../../domain/javascript/javascriptModuleResolutionMode.js";
@@ -457,9 +458,10 @@ const moduleFormat = (
   path: string,
   ir: JavaScriptModuleSemanticIr,
 ): "commonjs" | "esm" | "mixed" | "unknown" => {
+  const loader = explicitJavaScriptLoaderMode(path);
+  if (loader === "module") return "esm";
+  if (loader === "commonjs") return "commonjs";
   const extension = posix.extname(path).toLowerCase();
-  if (extension === ".mjs" || extension === ".mts") return "esm";
-  if (extension === ".cjs" || extension === ".cts") return "commonjs";
   if (extension === ".ts" || extension === ".tsx") return "unknown";
   const esm = ir.moduleLinks.some(({ kind }) =>
     ["import", "export", "re-export"].includes(kind),
