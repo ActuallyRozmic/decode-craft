@@ -614,6 +614,39 @@ const signerIdentifier = (
   );
 };
 
+// RFC 5652 5.3 and 11.1-11.2: present signedAttrs MUST hold one content-type
+// and one message-digest attribute, each with a single value of its type.
+// Without the digest, the signature does not cover the signed content.
+const REQUIRED_SIGNED_ATTRIBUTES = [
+  ["1.2.840.113549.1.9.3", "content-type", 0x06, "OBJECT IDENTIFIER"],
+  ["1.2.840.113549.1.9.4", "message-digest", 0x04, "OCTET STRING"],
+] as const;
+
+const requireSignedAttributes = (node: Asn1BerNode): void => {
+  const found = new Map<string, Asn1BerNode>();
+  for (const attribute of node.children) {
+    const fields = sequence(attribute, "SignerInfo signed attribute");
+    const [oid, values] = fields;
+    if (fields.length !== 2 || oid?.tag !== 0x06 || values?.tag !== 0x31)
+      return fail("SignerInfo signed attribute is missing its type or values.");
+    const type = decodeOid(oid.content);
+    const rule = REQUIRED_SIGNED_ATTRIBUTES.find(([id]) => id === type);
+    if (rule === undefined) continue;
+    if (found.has(type))
+      return fail(`SignerInfo signedAttrs repeats the ${rule[1]} attribute.`);
+    found.set(type, values);
+  }
+  for (const [type, label, tag, typeName] of REQUIRED_SIGNED_ATTRIBUTES) {
+    const values = found.get(type);
+    if (values === undefined)
+      return fail(`SignerInfo signedAttrs lacks a ${label} attribute.`);
+    if (values.children.length !== 1 || values.children[0]?.tag !== tag)
+      return fail(
+        `SignerInfo ${label} attribute does not hold one ${typeName} value.`,
+      );
+  }
+};
+
 const parseSigner = (
   node: Asn1BerNode,
   names: DecodedNameBudget,
@@ -644,6 +677,7 @@ const parseSigner = (
   const authenticated = children[cursor]?.tag === 0xa0;
   if (authenticated) {
     requireDefiniteEncoding(children[cursor]!, "SignerInfo signedAttrs");
+    requireSignedAttributes(children[cursor]!);
     cursor += 1;
   }
   const signatureAlg = children[cursor];
