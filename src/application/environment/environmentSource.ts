@@ -4,6 +4,12 @@ import {
   isJsonLike,
   mediaTypeEssence,
 } from "../../domain/analysisView/recordedMediaType.js";
+import {
+  hasXssiGuardPrefix,
+  isXssiEligibleMediaType,
+  parseXssiOrExactJson,
+  XSSI_RESPONSE_BODY_LIMIT_BYTES,
+} from "../../domain/analysisView/rpcOperationSelector.js";
 
 import {
   analysisViewResultSchema,
@@ -27,7 +33,6 @@ import {
 } from "../../domain/analysisErrorCore.js";
 import type { Evidence } from "../../domain/evidence.js";
 import { safeParseImmutableEvidence } from "../../domain/evidenceValidation.js";
-import { parseExactJson } from "../../domain/exactJsonNumber.js";
 import { projectInputIssues } from "../../domain/inputIssueProjection.js";
 import { immutableJsonSnapshotMember } from "../../domain/immutableJson.js";
 import type { JsonValue } from "../../domain/jsonValue.js";
@@ -97,10 +102,17 @@ export const replayedBody = (exchange: RecordedExchange): ReplayedBody => {
     Buffer.byteLength(text, "utf8") > REPLAY_BODY_LIMIT_BYTES
   )
     return { kind: "cut", text };
+  const essence =
+    exchange.contentType === null
+      ? null
+      : mediaTypeEssence(exchange.contentType);
+  const isJson = exchange.contentType !== null && isJsonLike(essence);
   const value =
-    exchange.contentType !== null &&
-    isJsonLike(mediaTypeEssence(exchange.contentType))
-      ? parseExactJson(text)
+    isJson ||
+    (isXssiEligibleMediaType(essence) &&
+      hasXssiGuardPrefix(text) &&
+      Buffer.byteLength(text, "utf8") <= XSSI_RESPONSE_BODY_LIMIT_BYTES)
+      ? parseXssiOrExactJson(text)
       : undefined;
   return value === undefined ? { kind: "text", text } : { kind: "json", value };
 };

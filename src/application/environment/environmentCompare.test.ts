@@ -1060,3 +1060,308 @@ describe("what a probe did not observe", () => {
   registerProbeCoverageCases();
   registerProbeOrderingAndCaptureCases();
 });
+
+describe("multiplexed POST RPC probe comparison", () => {
+  it("routes multiplexed GraphQL, JSON-RPC 2.0, and XSSI batchexecute probes to their discriminated state-served tools", async () => {
+    const { inspectAnalysisView } =
+      await import("../analysisView/AnalysisViewService.js");
+    const makeCapture = () => {
+      const entries = [
+        {
+          startedDateTime: "2026-10-20T09:00:00.000Z",
+          time: 10,
+          request: {
+            method: "POST",
+            url: "http://grafana.example/graphql",
+            postData: {
+              mimeType: "application/json",
+              text: JSON.stringify({
+                operationName: "GetViewer",
+                query: "query GetViewer { viewer { id } }",
+              }),
+            },
+          },
+          response: {
+            status: 200,
+            content: {
+              mimeType: "application/json",
+              text: JSON.stringify({ data: { viewer: { id: "u1" } } }),
+            },
+          },
+        },
+        {
+          startedDateTime: "2026-10-20T09:00:01.000Z",
+          time: 10,
+          request: {
+            method: "POST",
+            url: "http://grafana.example/graphql",
+            postData: {
+              mimeType: "application/json",
+              text: JSON.stringify({
+                operationName: "ListProjects",
+                query: "query ListProjects { projects { slug } }",
+              }),
+            },
+          },
+          response: {
+            status: 200,
+            content: {
+              mimeType: "application/json",
+              text: JSON.stringify({
+                data: { projects: [{ slug: "alpha" }] },
+              }),
+            },
+          },
+        },
+        {
+          startedDateTime: "2026-10-20T09:00:02.000Z",
+          time: 10,
+          request: {
+            method: "POST",
+            url: "http://grafana.example/rpc",
+            postData: {
+              mimeType: "application/json",
+              text: JSON.stringify({
+                jsonrpc: "2.0",
+                method: "tools/list",
+                id: 1,
+              }),
+            },
+          },
+          response: {
+            status: 200,
+            content: {
+              mimeType: "application/json",
+              text: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: { tools: ["ping"] },
+              }),
+            },
+          },
+        },
+        {
+          startedDateTime: "2026-10-20T09:00:03.000Z",
+          time: 10,
+          request: {
+            method: "POST",
+            url: "http://grafana.example/_/AppUi/data/batchexecute?rpcids=GetNotes",
+            postData: {
+              mimeType: "application/x-www-form-urlencoded",
+              text: new URLSearchParams({
+                "f.req": JSON.stringify([
+                  [["GetNotes", "[]", null, "generic"]],
+                ]),
+              }).toString(),
+            },
+          },
+          response: {
+            status: 200,
+            content: {
+              mimeType: "application/x-javascript",
+              text: ')]}\'\n[[["wrb.fr","GetNotes","[{\\"id\\":7}]",null,null,null,"generic"]]]',
+            },
+          },
+        },
+      ];
+      return analysisViewCaptureEvidence(
+        environmentManifestCaptureFixture(entries),
+      );
+    };
+    const recorded = makeCapture();
+    const manifest = await inspectAnalysisView({
+      source: { kind: "inline", evidence: recorded },
+      view: { kind: "environment-manifest" },
+    });
+    if (!manifest.ok) throw manifest.error;
+    const rpcSource = environmentServeSource({
+      manifest: manifest.value,
+      capture: recorded,
+    });
+    const report = compareEnvironment({
+      source: rpcSource,
+      captureValue: recorded,
+      probes: [{ label: "rpc-probe", value: makeCapture() }],
+      operation: "environment-compare",
+    });
+    if (!report.ok) throw report.error;
+    expect(report.value.summary).toMatchObject({
+      steps: 4,
+      equal: 4,
+      agreement: 1,
+    });
+    expect(report.value.probes[0]?.results.map((step) => step.tool)).toEqual([
+      "post_graphql_get_viewer",
+      "post_graphql_list_projects",
+      "post_rpc_tools_list",
+      "post_appui_data_batchexecute_get_notes",
+    ]);
+  });
+});
+
+describe("multiplexed RPC budget and XSSI origin parity in comparison", () => {
+  it("routes >64 KiB JSON-RPC POST requests to the undispatched tool instead of a smaller RPC operation's tool", async () => {
+    const { inspectAnalysisView } =
+      await import("../analysisView/AnalysisViewService.js");
+    const paddedRpcText = `{"jsonrpc":"2.0","method":"tools/list","id":2}${" ".repeat(70_000)}`;
+    const makeCapture = () =>
+      analysisViewCaptureEvidence(
+        environmentManifestCaptureFixture([
+          {
+            startedDateTime: "2026-10-20T09:00:00.000Z",
+            time: 10,
+            request: {
+              method: "POST",
+              url: "http://rpc.example/rpc/query",
+              postData: {
+                mimeType: "application/json",
+                text: JSON.stringify({
+                  jsonrpc: "2.0",
+                  method: "tools/list",
+                  id: 1,
+                }),
+              },
+            },
+            response: {
+              status: 200,
+              content: {
+                mimeType: "application/json",
+                text: JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  result: ["small"],
+                }),
+              },
+            },
+          },
+          {
+            startedDateTime: "2026-10-20T09:00:01.000Z",
+            time: 10,
+            request: {
+              method: "POST",
+              url: "http://rpc.example/rpc/query",
+              postData: {
+                mimeType: "application/json",
+                text: paddedRpcText,
+              },
+            },
+            response: {
+              status: 200,
+              content: {
+                mimeType: "application/json",
+                text: JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 2,
+                  result: ["large"],
+                }),
+              },
+            },
+          },
+        ]),
+      );
+    const recorded = makeCapture();
+    const manifest = await inspectAnalysisView({
+      source: { kind: "inline", evidence: recorded },
+      view: { kind: "environment-manifest" },
+    });
+    if (!manifest.ok) throw manifest.error;
+    const rpcSource = environmentServeSource({
+      manifest: manifest.value,
+      capture: recorded,
+    });
+    const report = compareEnvironment({
+      source: rpcSource,
+      captureValue: recorded,
+      probes: [{ label: "oversized-rpc", value: makeCapture() }],
+      operation: "environment-compare",
+    });
+    if (!report.ok) throw report.error;
+    expect(report.value.summary).toMatchObject({
+      steps: 2,
+      equal: 2,
+      agreement: 1,
+    });
+    expect(report.value.probes[0]?.results.map((step) => step.tool)).toEqual([
+      "post_rpc_query_tools_list",
+      "post_rpc_query",
+    ]);
+  });
+});
+
+describe("XSSI response size parity in probe origin selection", () => {
+  it("shares the 64 KiB XSSI size check between manifest and probe origin selection", async () => {
+    const { inspectAnalysisView } =
+      await import("../analysisView/AnalysisViewService.js");
+    const largeXssiJs = `)]}'\n{"pad":"${"x".repeat(70_000)}"}`;
+    const makeCapture = () =>
+      analysisViewCaptureEvidence(
+        environmentManifestCaptureFixture([
+          {
+            startedDateTime: "2026-10-20T09:00:00.000Z",
+            time: 10,
+            request: { method: "GET", url: "http://api.example/api/items" },
+            response: {
+              status: 200,
+              content: {
+                mimeType: "application/json",
+                text: JSON.stringify([{ id: "item-1" }]),
+              },
+            },
+          },
+          {
+            startedDateTime: "2026-10-20T09:00:01.000Z",
+            time: 10,
+            request: { method: "GET", url: "http://cdn.example/feed/1" },
+            response: {
+              status: 200,
+              content: {
+                mimeType: "application/javascript",
+                text: largeXssiJs,
+              },
+            },
+          },
+          {
+            startedDateTime: "2026-10-20T09:00:02.000Z",
+            time: 10,
+            request: { method: "GET", url: "http://cdn.example/feed/2" },
+            response: {
+              status: 200,
+              content: {
+                mimeType: "application/javascript",
+                text: largeXssiJs,
+              },
+            },
+          },
+        ]),
+      );
+    const recorded = makeCapture();
+    const manifest = await inspectAnalysisView({
+      source: { kind: "inline", evidence: recorded },
+      view: { kind: "environment-manifest" },
+    });
+    if (!manifest.ok) throw manifest.error;
+    expect(manifest.value.normalized_result).toMatchObject({
+      origin: "http://api.example",
+    });
+    const apiSource = environmentServeSource({
+      manifest: manifest.value,
+      capture: recorded,
+    });
+    const report = compareEnvironment({
+      source: apiSource,
+      captureValue: recorded,
+      probes: [{ label: "xssi-origin", value: makeCapture() }],
+      operation: "environment-compare",
+    });
+    if (!report.ok) throw report.error;
+    expect(report.value.summary).toMatchObject({
+      steps: 1,
+      equal: 1,
+      unobserved: 2,
+    });
+    expect(report.value.probes[0]?.unobserved).toEqual([
+      { ordinal: 1, reason: "other-origin" },
+      { ordinal: 2, reason: "other-origin" },
+    ]);
+  });
+});
