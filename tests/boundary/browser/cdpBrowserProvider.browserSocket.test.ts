@@ -3,66 +3,211 @@ import { createServer, type Socket } from "node:net";
 import { describe, expect, it, vi } from "vitest";
 
 import { CdpBrowserProvider } from "../../../src/browser/CdpBrowserProvider.js";
+import { CdpConnection } from "../../../src/browser/CdpConnection.js";
+import { CdpTargetSessionOwner } from "../../../src/browser/CdpTargetSessionOwner.js";
 import { openCdpEndpoint } from "../../../src/browser/CdpTargetSession.js";
 import { AnalysisError } from "../../../src/domain/analysisErrorBase.js";
 import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
+import { ProviderCleanupError } from "../../../src/domain/providerCleanupError.js";
 import {
   browserObservationEndpointSchema,
   inspectWebPageInputSchema,
   listBrowserTargetsInputSchema,
 } from "../../../src/domain/browserObservation.js";
+import { observeWebSessionInputSchema } from "../../../src/domain/browserSession.js";
+import { captureWebScreenshotInputSchema } from "../../../src/domain/webScreenshot.js";
 import { startFakeCdpBrowser } from "../../fixtures/fakeCdpBrowser.js";
+import { awaitAcknowledgement } from "../../fixtures/lifecycleAcknowledgement.js";
 import { trackBrowser } from "./cdpBrowserProvider.support.js";
 
 describe("CdpBrowserProvider: browser socket without HTTP discovery", () => {
-  it("discovers and inspects a page through one browser socket", async () => {
+  it("reuses one admitted browser socket across sequential operations and closes on provider shutdown", async () => {
     const browser = await startFakeCdpBrowser();
     trackBrowser(browser);
     const provider = new CdpBrowserProvider();
-    const throughHttp = await provider.listTargets(
-      listBrowserTargetsInputSchema.parse({ cdp_endpoint: browser.endpoint }),
-    );
-    if (!throughHttp.ok) throw throughHttp.error;
-    const httpRequests = browser.httpRequests.length;
-    const openedBefore = browser.openedConnectionCount();
+    try {
+      const throughHttp = await provider.listTargets(
+        listBrowserTargetsInputSchema.parse({ cdp_endpoint: browser.endpoint }),
+      );
+      if (!throughHttp.ok) throw throughHttp.error;
+      const httpRequests = browser.httpRequests.length;
+      const openedBefore = browser.openedConnectionCount();
 
-    const listed = await provider.listTargets(
-      listBrowserTargetsInputSchema.parse({
-        cdp_endpoint: browser.browserWebSocketUrl,
-      }),
-    );
-    if (!listed.ok) throw listed.error;
-    expect(listed.value.targets).toEqual(throughHttp.value.targets);
-    expect(listed.value.excluded).toEqual(throughHttp.value.excluded);
-    expect(listed.value.browser).toEqual({
-      ...throughHttp.value.browser,
-      revision: "@fake-revision",
+      const listed = await provider.listTargets(
+        listBrowserTargetsInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+        }),
+      );
+      if (!listed.ok) throw listed.error;
+      expect(listed.value.targets).toEqual(throughHttp.value.targets);
+      expect(listed.value.excluded).toEqual(throughHttp.value.excluded);
+      expect(listed.value.browser).toEqual({
+        ...throughHttp.value.browser,
+        revision: "@fake-revision",
+      });
+      expect(browser.openedConnectionCount()).toBe(openedBefore + 1);
+      expect(browser.activeConnectionCount()).toBe(1);
+
+      const commandsBeforeInspect = browser.commands.length;
+      const inspected = await provider.inspectPage(
+        inspectWebPageInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+          target_id: "allowed-page",
+          observation_ms: 0,
+        }),
+      );
+      if (!inspected.ok) throw inspected.error;
+      expect(inspected.value.target.origin).toBe(browser.allowedOrigin);
+      expect(
+        browser.commands
+          .slice(commandsBeforeInspect, commandsBeforeInspect + 3)
+          .map(({ method, params }) => ({ method, params })),
+      ).toEqual([
+        { method: "Browser.getVersion", params: {} },
+        { method: "Target.getTargets", params: {} },
+        {
+          method: "Target.attachToTarget",
+          params: { targetId: "allowed-page", flatten: true },
+        },
+      ]);
+      expect(
+        browser.commands
+          .slice(commandsBeforeInspect)
+          .map(({ method }) => method),
+      ).toContain("Target.detachFromTarget");
+      expect(browser.openedConnectionCount()).toBe(openedBefore + 1);
+      expect(browser.activeConnectionCount()).toBe(1);
+
+      const commandsBeforeScreenshot = browser.commands.length;
+      const screenshot = await provider.captureScreenshot(
+        captureWebScreenshotInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+          target_id: "allowed-page",
+        }),
+      );
+      if (!screenshot.ok) throw screenshot.error;
+      expect(
+        browser.commands
+          .slice(commandsBeforeScreenshot)
+          .map(({ method }) => method),
+      ).toContain("Target.detachFromTarget");
+      expect(browser.httpRequests).toHaveLength(httpRequests);
+      expect(browser.openedConnectionCount()).toBe(openedBefore + 1);
+      expect(browser.activeConnectionCount()).toBe(1);
+    } finally {
+      await provider.close();
+    }
+    await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+  });
+});
+
+describe("CdpBrowserProvider: browser socket eviction and per-call scoping", () => {
+  it("evicts a dropped browser socket and reconnects cleanly on the next call", async () => {
+    const browser = await startFakeCdpBrowser();
+    trackBrowser(browser);
+    const provider = new CdpBrowserProvider();
+    try {
+      const first = await provider.listTargets(
+        listBrowserTargetsInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+        }),
+      );
+      if (!first.ok) throw first.error;
+      expect(browser.openedConnectionCount()).toBe(1);
+      expect(browser.activeConnectionCount()).toBe(1);
+
+      browser.closeActiveConnections();
+      await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+
+      const second = await provider.inspectPage(
+        inspectWebPageInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+          target_id: "allowed-page",
+          observation_ms: 0,
+        }),
+      );
+      if (!second.ok) throw second.error;
+      expect(second.value.target.origin).toBe(browser.allowedOrigin);
+      expect(browser.openedConnectionCount()).toBe(2);
+      expect(browser.activeConnectionCount()).toBe(1);
+    } finally {
+      await provider.close();
+    }
+    await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+  });
+
+  it("closes a shared browser socket when Target.detachFromTarget fails so no target session leaks", async () => {
+    const browser = await startFakeCdpBrowser({
+      commandError: ({ method }) =>
+        method === "Target.detachFromTarget"
+          ? { code: -32_000, message: "Detach rejected" }
+          : undefined,
     });
+    trackBrowser(browser);
+    const provider = new CdpBrowserProvider();
+    try {
+      const inspected = await provider.inspectPage(
+        inspectWebPageInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+          target_id: "allowed-page",
+          observation_ms: 0,
+        }),
+      );
+      if (!inspected.ok) throw inspected.error;
+      await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+      expect(browser.openedConnectionCount()).toBe(1);
 
-    const commandsBefore = browser.commands.length;
-    const inspected = await provider.inspectPage(
-      inspectWebPageInputSchema.parse({
-        cdp_endpoint: browser.browserWebSocketUrl,
-        target_id: "allowed-page",
-        observation_ms: 0,
-      }),
-    );
-    if (!inspected.ok) throw inspected.error;
-    expect(inspected.value.target.origin).toBe(browser.allowedOrigin);
-    expect(
-      browser.commands
-        .slice(commandsBefore, commandsBefore + 3)
-        .map(({ method, params }) => ({ method, params })),
-    ).toEqual([
-      { method: "Browser.getVersion", params: {} },
-      { method: "Target.getTargets", params: {} },
-      {
-        method: "Target.attachToTarget",
-        params: { targetId: "allowed-page", flatten: true },
-      },
-    ]);
-    expect(browser.httpRequests).toHaveLength(httpRequests);
-    expect(browser.openedConnectionCount()).toBe(openedBefore + 2);
+      const listed = await provider.listTargets(
+        listBrowserTargetsInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+        }),
+      );
+      if (!listed.ok) throw listed.error;
+      expect(browser.openedConnectionCount()).toBe(2);
+      expect(browser.activeConnectionCount()).toBe(1);
+    } finally {
+      await provider.close();
+    }
+    await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+  });
+
+  it("preserves per-operation command_timeout_ms and operation identity on a reused browser socket", async () => {
+    const browser = await startFakeCdpBrowser({
+      hangOnMethod: "Page.enable",
+    });
+    trackBrowser(browser);
+    const provider = new CdpBrowserProvider();
+    try {
+      const listed = await provider.listTargets(
+        listBrowserTargetsInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+        }),
+      );
+      if (!listed.ok) throw listed.error;
+      expect(browser.openedConnectionCount()).toBe(1);
+
+      const timedOut = await provider.inspectPage(
+        inspectWebPageInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+          target_id: "allowed-page",
+          observation_ms: 0,
+          command_timeout_ms: 60,
+        }),
+      );
+      expect(timedOut).toMatchObject({
+        ok: false,
+        error: {
+          _tag: "BrowserObservationError",
+          operation: "inspect_web_page",
+          reason: "timeout",
+        },
+      });
+      if (timedOut.ok) throw new Error("Expected command timeout");
+      expect(timedOut.error.userMessage).toContain("60 ms command_timeout_ms");
+      expect(browser.openedConnectionCount()).toBe(1);
+    } finally {
+      await provider.close();
+    }
     await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
   });
 });
@@ -98,56 +243,78 @@ it("retains browser-socket siblings and reports invalid attachment as unknown, n
         : undefined,
   });
   trackBrowser(browser);
-  const result = await new CdpBrowserProvider().listTargets(
-    listBrowserTargetsInputSchema.parse({
-      cdp_endpoint: browser.browserWebSocketUrl,
-    }),
-  );
-  if (!result.ok) throw result.error;
-  expect(
-    result.value.targets.map(({ target_id, attached, title }) => [
-      target_id,
-      attached,
-      title,
-    ]),
-  ).toEqual([
-    ["first", null, ""],
-    ["second", false, "Good"],
-  ]);
-  const limitations = result.value.limitations.join("\n");
-  expect(limitations).toContain(
-    'reported malformed attached metadata "unknown"',
-  );
-  expect(limitations).toContain("reported malformed title metadata 3");
-  expect(
-    result.value.limitations.filter((item) =>
-      item.includes("target identity is malformed"),
-    ),
-  ).toHaveLength(2);
-  expect(limitations).not.toContain("omitted attachment");
+  const provider = new CdpBrowserProvider();
+  try {
+    const result = await provider.listTargets(
+      listBrowserTargetsInputSchema.parse({
+        cdp_endpoint: browser.browserWebSocketUrl,
+      }),
+    );
+    if (!result.ok) throw result.error;
+    expect(
+      result.value.targets.map(({ target_id, attached, title }) => [
+        target_id,
+        attached,
+        title,
+      ]),
+    ).toEqual([
+      ["first", null, ""],
+      ["second", false, "Good"],
+    ]);
+    const limitations = result.value.limitations.join("\n");
+    expect(limitations).toContain(
+      'reported malformed attached metadata "unknown"',
+    );
+    expect(limitations).toContain("reported malformed title metadata 3");
+    expect(
+      result.value.limitations.filter((item) =>
+        item.includes("target identity is malformed"),
+      ),
+    ).toHaveLength(2);
+    expect(limitations).not.toContain("omitted attachment");
+  } finally {
+    await provider.close();
+  }
   await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
 });
 
 describe("CdpBrowserProvider: browser socket failures and cleanup", () => {
-  it("closes an unadopted browser socket when the target is missing", async () => {
+  it("retains an admitted browser socket when the target is missing and closes it on shutdown", async () => {
     const browser = await startFakeCdpBrowser();
     trackBrowser(browser);
-    const result = await new CdpBrowserProvider().inspectPage(
-      inspectWebPageInputSchema.parse({
-        cdp_endpoint: browser.browserWebSocketUrl,
-        target_id: "missing",
-        observation_ms: 0,
-      }),
-    );
+    const provider = new CdpBrowserProvider();
+    try {
+      const result = await provider.inspectPage(
+        inspectWebPageInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+          target_id: "missing",
+          observation_ms: 0,
+        }),
+      );
 
-    expect(result).toMatchObject({
-      ok: false,
-      error: { _tag: "BrowserObservationError", reason: "target_not_found" },
-    });
-    expect(browser.commands.map(({ method }) => method)).toEqual([
-      "Browser.getVersion",
-      "Target.getTargets",
-    ]);
+      expect(result).toMatchObject({
+        ok: false,
+        error: { _tag: "BrowserObservationError", reason: "target_not_found" },
+      });
+      expect(browser.commands.map(({ method }) => method)).toEqual([
+        "Browser.getVersion",
+        "Target.getTargets",
+      ]);
+      expect(browser.openedConnectionCount()).toBe(1);
+      expect(browser.activeConnectionCount()).toBe(1);
+
+      const recovered = await provider.inspectPage(
+        inspectWebPageInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+          target_id: "allowed-page",
+          observation_ms: 0,
+        }),
+      );
+      if (!recovered.ok) throw recovered.error;
+      expect(browser.openedConnectionCount()).toBe(1);
+    } finally {
+      await provider.close();
+    }
     await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
   });
 
@@ -290,4 +457,325 @@ describe("CdpBrowserProvider: browser socket discovery deadline", () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+});
+
+describe("CdpBrowserProvider: shared browser socket lifecycle regressions", () => {
+  it("closes a shared browser socket immediately when detach fails alongside an active observation", async () => {
+    const browser = await startFakeCdpBrowser({
+      commandError: ({ method }) =>
+        method === "Target.detachFromTarget"
+          ? { code: -32_000, message: "Detach rejected" }
+          : undefined,
+    });
+    trackBrowser(browser);
+    const provider = new CdpBrowserProvider();
+    const closeSpy = vi.spyOn(CdpConnection.prototype, "close");
+    let armed!: () => void;
+    const observationArmed = new Promise<void>((resolve) => {
+      armed = resolve;
+    });
+    const controller = new AbortController();
+    let observing: ReturnType<CdpBrowserProvider["observeSession"]> | undefined;
+    try {
+      observing = provider.observeSession(
+        observeWebSessionInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+          target_id: "allowed-page",
+          observation_ms: 15_000,
+        }),
+        {
+          signal: controller.signal,
+          progress: {
+            report: async (update) => {
+              if (update.completed === 1) armed();
+            },
+          },
+        },
+      );
+      await awaitAcknowledgement(
+        observationArmed,
+        observing,
+        "peer session observation start",
+      );
+      expect(browser.openedConnectionCount()).toBe(1);
+      expect(browser.activeConnectionCount()).toBe(1);
+
+      const inspected = await provider.inspectPage(
+        inspectWebPageInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+          target_id: "allowed-page",
+          observation_ms: 0,
+        }),
+      );
+      if (!inspected.ok) throw inspected.error;
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+      expect(browser.openedConnectionCount()).toBe(1);
+      await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+
+      const session = await observing;
+      if (!session.ok) throw session.error;
+      expect(session.value.window.end_reason).toBe("transport_disconnected");
+    } finally {
+      controller.abort(new Error("test teardown"));
+      await observing?.catch(() => undefined);
+      closeSpy.mockRestore();
+      await provider.close();
+    }
+  });
+
+  it("surfaces cleanupIncomplete when forced shared-socket close fails after detach rejection", async () => {
+    const browser = await startFakeCdpBrowser({
+      commandError: ({ method }) =>
+        method === "Target.detachFromTarget"
+          ? { code: -32_000, message: "Detach rejected" }
+          : undefined,
+    });
+    trackBrowser(browser);
+    const provider = new CdpBrowserProvider();
+    const originalClose = CdpConnection.prototype.close;
+    let denyClose = false;
+    const closeSpy = vi
+      .spyOn(CdpConnection.prototype, "close")
+      .mockImplementation(function (this: CdpConnection) {
+        return denyClose
+          ? Promise.reject(new Error("controlled shared socket close failure"))
+          : originalClose.call(this);
+      });
+    let armed!: () => void;
+    const observationArmed = new Promise<void>((resolve) => {
+      armed = resolve;
+    });
+    const controller = new AbortController();
+    let observing: ReturnType<CdpBrowserProvider["observeSession"]> | undefined;
+    try {
+      observing = provider.observeSession(
+        observeWebSessionInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+          target_id: "allowed-page",
+          observation_ms: 15_000,
+        }),
+        {
+          signal: controller.signal,
+          progress: {
+            report: async (update) => {
+              if (update.completed === 1) armed();
+            },
+          },
+        },
+      );
+      await awaitAcknowledgement(
+        observationArmed,
+        observing,
+        "peer session observation start",
+      );
+      denyClose = true;
+      const inspected = await provider.inspectPage(
+        inspectWebPageInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+          target_id: "allowed-page",
+          observation_ms: 0,
+        }),
+      );
+      if (inspected.ok)
+        throw new Error("Expected incomplete transport cleanup");
+      expect(inspected.error.cleanupIncomplete).toBe(true);
+      expect(inspected.error.partialObservation).toBeDefined();
+
+      controller.abort(new Error("end peer observation"));
+      await observing;
+      denyClose = false;
+      await provider.close();
+      expect(inspected.error.cleanupIncomplete).toBe(false);
+      await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+    } finally {
+      denyClose = false;
+      controller.abort(new Error("test teardown"));
+      await observing?.catch(() => undefined);
+      closeSpy.mockRestore();
+      await provider.close();
+    }
+  });
+});
+
+describe("CdpTargetSessionOwner: callback failures and idle protocol eviction", () => {
+  it("records cleanup lease ownership when finish() callback rejects and resolves on retryPending", async () => {
+    const browser = await startFakeCdpBrowser();
+    trackBrowser(browser);
+    const owner = new CdpTargetSessionOwner();
+    try {
+      const connection = await owner.connect(
+        browser.browserWebSocketUrl,
+        "inspect_web_page",
+        {},
+        "callback-failed-session",
+      );
+      const cleanup = vi.fn(async () => {
+        throw new Error("controlled cleanup callback failure");
+      });
+      const failure = await owner
+        .finish(connection, cleanup)
+        .catch((cause: unknown) => cause);
+      expect(failure).toBeInstanceOf(ProviderCleanupError);
+      if (!(failure instanceof AnalysisError))
+        throw new Error("Expected typed cleanup error");
+      expect(failure.cleanupIncomplete).toBe(true);
+      expect(failure.cleanupResources).toEqual(["callback-failed-session"]);
+      expect(browser.activeConnectionCount()).toBe(1);
+
+      await owner.retryPending();
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(failure.cleanupIncomplete).toBe(false);
+      await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+    } finally {
+      await owner.close();
+    }
+  });
+
+  it("evicts and closes an idle retained browser socket on fatal protocol failure", async () => {
+    const browser = await startFakeCdpBrowser();
+    trackBrowser(browser);
+    const provider = new CdpBrowserProvider();
+    const originalClose = CdpConnection.prototype.close;
+    let denyClose = true;
+    const closeSpy = vi
+      .spyOn(CdpConnection.prototype, "close")
+      .mockImplementation(function (this: CdpConnection) {
+        return denyClose
+          ? Promise.reject(new Error("controlled idle protocol close failure"))
+          : originalClose.call(this);
+      });
+    try {
+      const first = await provider.listTargets(
+        listBrowserTargetsInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+        }),
+      );
+      if (!first.ok) throw first.error;
+      expect(browser.activeConnectionCount()).toBe(1);
+
+      browser.emitRawMessage("{not-json");
+      await vi.waitFor(() => expect(closeSpy).toHaveBeenCalledTimes(1));
+
+      const blocked = await provider.listTargets(
+        listBrowserTargetsInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+        }),
+      );
+      if (blocked.ok) throw new Error("Expected pending cleanup refusal");
+      expect(blocked.error.cleanupIncomplete).toBe(true);
+
+      denyClose = false;
+      const recovered = await provider.listTargets(
+        listBrowserTargetsInputSchema.parse({
+          cdp_endpoint: browser.browserWebSocketUrl,
+        }),
+      );
+      if (!recovered.ok) throw recovered.error;
+      expect(blocked.error.cleanupIncomplete).toBe(false);
+      expect(browser.openedConnectionCount()).toBe(2);
+      expect(browser.activeConnectionCount()).toBe(1);
+
+      browser.emitRawMessage("{not-json-idle-second");
+      await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+    } finally {
+      closeSpy.mockRestore();
+      await provider.close();
+    }
+  });
+});
+
+it("blocks new admissions while forced shared-socket cleanup fails with an active peer, then recovers cleanly", async () => {
+  const browser = await startFakeCdpBrowser({
+    commandError: ({ method }) =>
+      method === "Target.detachFromTarget"
+        ? { code: -32_000, message: "Detach rejected" }
+        : undefined,
+  });
+  trackBrowser(browser);
+  const provider = new CdpBrowserProvider();
+  const originalClose = CdpConnection.prototype.close;
+  let denyClose = false;
+  const closeSpy = vi
+    .spyOn(CdpConnection.prototype, "close")
+    .mockImplementation(function (this: CdpConnection) {
+      return denyClose
+        ? Promise.reject(new Error("controlled shared socket close failure"))
+        : originalClose.call(this);
+    });
+  let armed!: () => void;
+  const observationArmed = new Promise<void>((resolve) => {
+    armed = resolve;
+  });
+  const controller = new AbortController();
+  let observing: ReturnType<CdpBrowserProvider["observeSession"]> | undefined;
+  try {
+    observing = provider.observeSession(
+      observeWebSessionInputSchema.parse({
+        cdp_endpoint: browser.browserWebSocketUrl,
+        target_id: "allowed-page",
+        observation_ms: 15_000,
+      }),
+      {
+        signal: controller.signal,
+        progress: {
+          report: async (update) => {
+            if (update.completed === 1) armed();
+          },
+        },
+      },
+    );
+    await awaitAcknowledgement(
+      observationArmed,
+      observing,
+      "peer session observation start",
+    );
+    expect(browser.openedConnectionCount()).toBe(1);
+
+    denyClose = true;
+    const failedInspect = await provider.inspectPage(
+      inspectWebPageInputSchema.parse({
+        cdp_endpoint: browser.browserWebSocketUrl,
+        target_id: "allowed-page",
+        observation_ms: 0,
+      }),
+    );
+    if (failedInspect.ok)
+      throw new Error("Expected failed forced shared-socket close");
+    expect(failedInspect.error.cleanupIncomplete).toBe(true);
+    expect(browser.openedConnectionCount()).toBe(1);
+
+    // Peer observation is still active; Call C must NOT bypass the unresolved close failure.
+    const blocked = await provider.listTargets(
+      listBrowserTargetsInputSchema.parse({
+        cdp_endpoint: browser.browserWebSocketUrl,
+      }),
+    );
+    if (blocked.ok)
+      throw new Error("Expected admission blocked on failed cleanup");
+    expect(blocked.error.cleanupIncomplete).toBe(true);
+    expect(browser.openedConnectionCount()).toBe(1);
+
+    // Allow close retry to succeed while peer observation is still unwinding.
+    denyClose = false;
+    const recovered = await provider.listTargets(
+      listBrowserTargetsInputSchema.parse({
+        cdp_endpoint: browser.browserWebSocketUrl,
+      }),
+    );
+    if (!recovered.ok) throw recovered.error;
+    expect(failedInspect.error.cleanupIncomplete).toBe(false);
+    expect(blocked.error.cleanupIncomplete).toBe(false);
+    expect(browser.openedConnectionCount()).toBe(2);
+
+    const session = await observing;
+    if (!session.ok) throw session.error;
+    expect(session.value.window.end_reason).toBe("transport_disconnected");
+  } finally {
+    denyClose = false;
+    controller.abort(new Error("test teardown"));
+    await observing?.catch(() => undefined);
+    closeSpy.mockRestore();
+    await provider.close();
+  }
+  await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
 });
